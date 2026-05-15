@@ -108,6 +108,19 @@ public class RTLinkFunctionDirectory {
 		return entries.size();
 	}
 
+	/**
+	 * Returns the directory entry at the given raw index.
+	 *
+	 * @param index 0-based index into the directory
+	 * @return the entry, or {@code null} if out of range
+	 */
+	public DirectoryEntry getEntry(int index) {
+		if (index < 0 || index >= entries.size()) {
+			return null;
+		}
+		return entries.get(index);
+	}
+
 	private static List<DirectoryEntry> tryParse(BinaryReader reader, long fileOffset,
 			int maxEntries, int numCodePages, long frameSize, boolean reversed)
 			throws IOException {

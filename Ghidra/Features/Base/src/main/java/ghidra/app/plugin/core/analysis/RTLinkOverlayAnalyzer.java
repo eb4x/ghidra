@@ -31,13 +31,14 @@ import ghidra.framework.options.Options;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.DataUtilities;
-import ghidra.program.model.listing.Program;
+import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.reloc.Relocation.Status;
 import ghidra.program.model.symbol.*;
 import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.InvalidInputException;
+import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.util.task.TaskMonitor;
 
 /**
@@ -147,9 +148,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				}
 			}
 
-			if (createStubXrefs && !overlayBlocks.isEmpty()) {
+			RTLinkFunctionDirectory directory = null;
+			if (!overlayBlocks.isEmpty()) {
 				monitor.setMessage("RTLink: Parsing function directory...");
-				RTLinkFunctionDirectory directory = null;
 				try {
 					directory = new RTLinkFunctionDirectory(reader,
 						globalTable.getCodeFileOffset(),
@@ -164,6 +165,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						e.getMessage());
 				}
 
+				if (directory != null) {
+					monitor.setMessage("RTLink: Seeding overlay entry points...");
+					seedOverlayEntryPoints(program, overlayBlocks, directory, log);
+				}
+			}
+
+			if (createStubXrefs && !overlayBlocks.isEmpty()) {
 				monitor.setMessage("RTLink: Discovering dispatch stubs...");
 				discoverAndProcessStubs(program, overlayBlocks, directory, log, monitor);
 			}
@@ -368,6 +376,35 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 	}
 
+	private void seedOverlayEntryPoints(Program program,
+			List<OverlayBlockInfo> overlayBlocks, RTLinkFunctionDirectory directory,
+			MessageLog log) {
+		SymbolTable symbolTable = program.getSymbolTable();
+		int count = 0;
+
+		for (int i = 0; i < directory.getEntryCount(); i++) {
+			RTLinkFunctionDirectory.DirectoryEntry entry = directory.getEntry(i);
+			if (entry == null || entry.pageNumber() == 0) {
+				continue;
+			}
+			int blockIndex = entry.pageNumber() - 1;
+			if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
+				continue;
+			}
+			OverlayBlockInfo info = overlayBlocks.get(blockIndex);
+			Address funcAddr = info.block().getStart().add(entry.offsetInPage());
+			if (info.block().contains(funcAddr)) {
+				labelAddress(symbolTable,
+					String.format("OVL%02d_%04X", entry.pageNumber(), entry.offsetInPage()),
+					funcAddr);
+				symbolTable.addExternalEntryPoint(funcAddr);
+				count++;
+			}
+		}
+
+		Msg.info(this, "RTLink/Plus: Seeded " + count + " overlay entry points");
+	}
+
 	private void discoverAndProcessStubs(Program program,
 			List<OverlayBlockInfo> overlayBlocks, RTLinkFunctionDirectory directory,
 			MessageLog log, TaskMonitor monitor) throws CancelledException {
@@ -401,6 +438,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
+		FunctionManager funcMgr = program.getFunctionManager();
 		int count = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
@@ -457,6 +495,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 										String.format("OVL%02d_%04X",
 											pageNum, entry.offsetInPage()),
 										targetAddr);
+									createThunkAtStub(funcMgr, searchAddr, targetAddr, 5);
 									count++;
 								}
 							}
@@ -482,6 +521,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
+		FunctionManager funcMgr = program.getFunctionManager();
 		byte[] pattern = { (byte) 0xCD, (byte) 0x3F };
 		int count = 0;
 
@@ -531,6 +571,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 								String.format("OVL%02d_%04X",
 									pageNum, targetOffset),
 								targetAddr);
+							createThunkAtStub(funcMgr, searchAddr, targetAddr, 6);
 							count++;
 						}
 					}
@@ -553,6 +594,40 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			return null;
 		}
 		return overlayBlocks.get(blockIndex);
+	}
+
+	private static void createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
+			Address targetAddr, int stubSize) {
+		Function overlayFunc = funcMgr.getFunctionAt(targetAddr);
+		if (overlayFunc == null) {
+			try {
+				overlayFunc = funcMgr.createFunction(null, targetAddr,
+					new AddressSet(targetAddr, targetAddr), SourceType.ANALYSIS);
+			}
+			catch (Exception e) {
+				return;
+			}
+		}
+
+		Function existingStub = funcMgr.getFunctionAt(stubAddr);
+		if (existingStub != null) {
+			try {
+				existingStub.setThunkedFunction(overlayFunc);
+			}
+			catch (IllegalArgumentException e) {
+				// ignore
+			}
+		}
+		else {
+			try {
+				AddressSet stubBody = new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
+				funcMgr.createThunkFunction(null, null, stubAddr,
+					stubBody, overlayFunc, SourceType.ANALYSIS);
+			}
+			catch (OverlappingFunctionException e) {
+				// ignore
+			}
+		}
 	}
 
 	private static void labelAddress(SymbolTable symbolTable, String label, Address addr) {
