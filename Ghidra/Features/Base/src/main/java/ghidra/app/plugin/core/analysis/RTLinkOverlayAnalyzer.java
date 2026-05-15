@@ -148,9 +148,24 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 
 			if (createStubXrefs && !overlayBlocks.isEmpty()) {
+				monitor.setMessage("RTLink: Parsing function directory...");
+				RTLinkFunctionDirectory directory = null;
+				try {
+					directory = new RTLinkFunctionDirectory(reader,
+						globalTable.getCodeFileOffset(),
+						(int) (globalTable.getCodeSize() / 4),
+						codePages.size(),
+						codePages.get(0).getFrameSize());
+					Msg.info(this, "RTLink/Plus: Parsed function directory with " +
+						directory.getEntryCount() + " entries");
+				}
+				catch (IOException e) {
+					log.appendMsg("RTLink: Failed to parse function directory: " +
+						e.getMessage());
+				}
+
 				monitor.setMessage("RTLink: Discovering dispatch stubs...");
-				discoverAndProcessStubs(program, overlayBlocks, globalTable, reader, log,
-					monitor);
+				discoverAndProcessStubs(program, overlayBlocks, directory, log, monitor);
 			}
 
 			if (markupHeaders) {
@@ -354,10 +369,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	private void discoverAndProcessStubs(Program program,
-			List<OverlayBlockInfo> overlayBlocks, RTLinkOverlayPage globalTable,
-			BinaryReader reader, MessageLog log, TaskMonitor monitor)
-			throws CancelledException {
-		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, log, monitor);
+			List<OverlayBlockInfo> overlayBlocks, RTLinkFunctionDirectory directory,
+			MessageLog log, TaskMonitor monitor) throws CancelledException {
+		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, directory, log, monitor);
 		int int3fStubs = 0;
 
 		if (jmpfStubs == 0) {
@@ -378,7 +392,12 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * Pattern: EA xx xx 00 00  (far jump to 0000:xxxx)
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
-			MessageLog log, TaskMonitor monitor) throws CancelledException {
+			RTLinkFunctionDirectory directory, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		if (directory == null || directory.getEntryCount() == 0) {
+			return 0;
+		}
+
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
@@ -410,31 +429,36 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						continue;
 					}
 
-					int targetOffset = Short.toUnsignedInt(memory.getShort(offAddr));
+					int virtualOffset = Short.toUnsignedInt(memory.getShort(offAddr));
 					int targetSegment = Short.toUnsignedInt(memory.getShort(segAddr));
 
-					if (targetSegment == 0x0000 && targetOffset > 0) {
-						OverlayBlockInfo target = resolveStubTarget(
-							targetOffset, overlayBlocks);
+					if (targetSegment == 0x0000 && virtualOffset > 0) {
+						RTLinkFunctionDirectory.DirectoryEntry entry =
+							directory.resolve(virtualOffset);
 
-						if (target != null) {
-							Address targetAddr =
-								target.block().getStart().add(targetOffset);
+						if (entry != null) {
+							OverlayBlockInfo target = resolveStubTarget(
+								entry, overlayBlocks);
 
-							if (target.block().contains(targetAddr)) {
-								refManager.addMemoryReference(searchAddr, targetAddr,
-									RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
+							if (target != null) {
+								Address targetAddr =
+									target.block().getStart().add(entry.offsetInPage());
 
-								int pageNum = target.page().getPageIndex() - 1;
-								labelAddress(symbolTable,
-									String.format("OVLSTUB_%02d_%04X",
-										pageNum, targetOffset),
-									searchAddr);
-								labelAddress(symbolTable,
-									String.format("OVL%02d_%04X",
-										pageNum, targetOffset),
-									targetAddr);
-								count++;
+								if (target.block().contains(targetAddr)) {
+									refManager.addMemoryReference(searchAddr, targetAddr,
+										RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
+
+									int pageNum = entry.pageNumber();
+									labelAddress(symbolTable,
+										String.format("OVLSTUB_%02d_%04X",
+											pageNum, entry.offsetInPage()),
+										searchAddr);
+									labelAddress(symbolTable,
+										String.format("OVL%02d_%04X",
+											pageNum, entry.offsetInPage()),
+										targetAddr);
+									count++;
+								}
 							}
 						}
 					}
@@ -521,20 +545,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		return count;
 	}
 
-	private OverlayBlockInfo resolveStubTarget(int virtualOffset,
+	private OverlayBlockInfo resolveStubTarget(
+			RTLinkFunctionDirectory.DirectoryEntry entry,
 			List<OverlayBlockInfo> overlayBlocks) {
-		for (OverlayBlockInfo info : overlayBlocks) {
-			if (virtualOffset < info.page().getCodeSize()) {
-				return info;
-			}
+		int blockIndex = entry.pageNumber() - 1;
+		if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
+			return null;
 		}
-		// If no single block contains the offset, try all blocks
-		for (OverlayBlockInfo info : overlayBlocks) {
-			if (info.block().contains(info.block().getStart().add(virtualOffset))) {
-				return info;
-			}
-		}
-		return null;
+		return overlayBlocks.get(blockIndex);
 	}
 
 	private static void labelAddress(SymbolTable symbolTable, String label, Address addr) {
