@@ -1,0 +1,43 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "/home/erikberg/src/ghidra/.venv/bin/python",
+      "args": ["/home/erikberg/src/ghidra/.venv/bin/bridge_mcp_ghidra.py"],
+      "env": {
+        "GHIDRA_MCP_URL": "http://127.0.0.1:8089"
+      }
+    },
+    "eclipse-ide": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8124/mcp/eclipse-ide",
+        "--allow-http",
+        "--header", "Authorization: Bearer b5c92618-4552-4a44-92f0-b1b6718beb88"
+      ]
+    },
+    "eclipse-coder": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8124/mcp/eclipse-coder",
+        "--allow-http",
+        "--header", "Authorization: Bearer b5c92618-4552-4a44-92f0-b1b6718beb88"
+      ]
+    },
+    "eclipse-runner": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8124/mcp/eclipse-runner",
+        "--allow-http",
+        "--header", "Authorization: Bearer b5c92618-4552-4a44-92f0-b1b6718beb88"
+      ]
+    },
+    "eclipse-git": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8124/mcp/eclipse-git",
+        "--allow-http",
+        "--header", "Authorization: Bearer b5c92618-4552-4a44-92f0-b1b6718beb88"
+      ]
+    }
+  }
+}
