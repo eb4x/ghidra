@@ -28,6 +28,7 @@ import ghidra.app.util.bin.format.mz.*;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.MzLoader;
 import ghidra.framework.options.Options;
+import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.DataUtilities;
@@ -38,17 +39,22 @@ import ghidra.program.model.symbol.*;
 import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.InvalidInputException;
-import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.util.task.TaskMonitor;
 
 /**
  * Detects and loads RTLink/Plus overlay pages from DOS MZ executables.
  * <p>
- * RTLink/Plus was a widely-used overlay manager for late-DOS commercial software
- * (Microprose, Sierra, etc.).  Overlay pages are stored at file offsets past the
- * MZ image end and are invisible to {@link MzLoader}'s static analysis.  This
- * analyzer creates overlay memory blocks for each page, applies segment
- * relocations, and wires cross-references from dispatch stubs to overlay functions.
+ * RTLink/Plus was a widely-used overlay manager for late-DOS commercial
+ * software (Microprose, Sierra, etc.). Overlay pages are stored at file offsets
+ * past the MZ image end and are invisible to {@link MzLoader}'s static
+ * analysis. This analyzer creates overlay memory blocks for each page, applies
+ * segment relocations, and wires cross-references from dispatch stubs to
+ * overlay functions.
+ * <p>
+ * Dispatch stubs are 14-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
+ * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes) + seg_delta (2 bytes).
+ * The page number is embedded directly in the stub — bits 0-13 of page_id give
+ * the 1-based overlay page number.
  */
 public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
@@ -60,6 +66,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
 
 	private static final int INITIAL_SEGMENT_VAL = 0x1000;
+
+	private static final byte OPCODE_CALLF = (byte) 0x9A;
+	private static final byte OPCODE_JMPF = (byte) 0xEA;
+	private static final int RTLINK_DISPATCH_OFFSET = 0x0DAB;
+	private static final int PAGE_ID_MASK = 0x3FFF;
 
 	private static final String OPTION_APPLY_RELOCS = "Apply Relocations";
 	private static final String OPTION_CREATE_XREFS = "Create Stub Cross-References";
@@ -87,8 +98,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	@Override
-	public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log)
-			throws CancelledException {
+	public boolean added(Program program, AddressSetView set, TaskMonitor monitor,
+			MessageLog log) throws CancelledException {
 		long txId = program.getCurrentTransactionInfo().getID();
 		if (txId == lastTxId) {
 			return true;
@@ -114,27 +125,27 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 
 			long imageEnd = computeImageEnd(header);
-			if (imageEnd <= 0 || imageEnd >= fileBytes.getSize()) {
+			long overlayStart = (imageEnd + 15) & ~15L;
+			if (overlayStart <= 0 || overlayStart >= fileBytes.getSize()) {
 				return false;
 			}
 
-			if (!detectRTLinkOverlay(reader, imageEnd, fileBytes.getSize())) {
+			if (!detectRTLinkOverlay(reader, overlayStart, fileBytes.getSize())) {
 				return false;
 			}
 
 			List<RTLinkOverlayPage> allPages =
-				RTLinkOverlayPage.parseAllPages(reader, imageEnd, fileBytes.getSize());
+				RTLinkOverlayPage.parseAllPages(reader, overlayStart, fileBytes.getSize());
 			if (allPages.size() < 2) {
 				return false;
 			}
 
-			RTLinkOverlayPage globalTable = allPages.get(0);
 			List<RTLinkOverlayPage> codePages = allPages.subList(1, allPages.size());
 
 			Msg.info(this, String.format(
 				"RTLink/Plus: Found %d overlay pages (global table + %d code pages) " +
 					"at file offset 0x%X",
-				allPages.size(), codePages.size(), imageEnd));
+				allPages.size(), codePages.size(), overlayStart));
 
 			List<OverlayBlockInfo> overlayBlocks =
 				createOverlayBlocks(program, fileBytes, codePages, log, monitor);
@@ -148,32 +159,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				}
 			}
 
-			RTLinkFunctionDirectory directory = null;
-			if (!overlayBlocks.isEmpty()) {
-				monitor.setMessage("RTLink: Parsing function directory...");
-				try {
-					directory = new RTLinkFunctionDirectory(reader,
-						globalTable.getCodeFileOffset(),
-						(int) (globalTable.getCodeSize() / 4),
-						codePages.size(),
-						codePages.get(0).getFrameSize());
-					Msg.info(this, "RTLink/Plus: Parsed function directory with " +
-						directory.getEntryCount() + " entries");
-				}
-				catch (IOException e) {
-					log.appendMsg("RTLink: Failed to parse function directory: " +
-						e.getMessage());
-				}
-
-				if (directory != null) {
-					monitor.setMessage("RTLink: Seeding overlay entry points...");
-					seedOverlayEntryPoints(program, overlayBlocks, directory, log);
-				}
-			}
-
 			if (createStubXrefs && !overlayBlocks.isEmpty()) {
 				monitor.setMessage("RTLink: Discovering dispatch stubs...");
-				discoverAndProcessStubs(program, overlayBlocks, directory, log, monitor);
+				discoverAndProcessStubs(program, overlayBlocks, log, monitor);
 			}
 
 			if (markupHeaders) {
@@ -213,7 +201,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	// ---- Private implementation ----
 
-	private record OverlayBlockInfo(RTLinkOverlayPage page, MemoryBlock block) {}
+	private record OverlayBlockInfo(RTLinkOverlayPage page, MemoryBlock block) {
+	}
 
 	private static boolean isAlreadyAnalyzed(Program program) {
 		return program.getOptions(Program.PROGRAM_INFO).getBoolean(ANALYZED_FLAG, false);
@@ -292,13 +281,12 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				result.add(new OverlayBlockInfo(page, block));
 			}
 			else {
-				log.appendMsg("RTLink: Failed to create block for page " +
-					(page.getPageIndex() - 1));
+				log.appendMsg(
+					"RTLink: Failed to create block for page " + (page.getPageIndex() - 1));
 			}
 		}
 
-		Msg.info(this,
-			"RTLink/Plus: Created " + result.size() + " overlay memory blocks");
+		Msg.info(this, "RTLink/Plus: Created " + result.size() + " overlay memory blocks");
 		return result;
 	}
 
@@ -306,8 +294,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		Symbol entry = SymbolUtilities.getLabelOrFunctionSymbol(program, "entry",
 			err -> { /* ignore */ });
 		if (entry == null) {
-			Msg.warn(this, "RTLink: No entry point found, using default DS=" +
-				Integer.toHexString(INITIAL_SEGMENT_VAL));
 			return INITIAL_SEGMENT_VAL;
 		}
 
@@ -332,8 +318,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			// fall through
 		}
 
-		Msg.warn(this, "RTLink: Could not determine DS register, using default " +
-			Integer.toHexString(INITIAL_SEGMENT_VAL));
 		return INITIAL_SEGMENT_VAL;
 	}
 
@@ -362,11 +346,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 				memory.setShort(relocAddr, (short) segmentValue);
 
-				program.getRelocationTable()
-						.add(relocAddr, Status.APPLIED, 0,
-							new long[] { reloc.getOffset(), reloc.getSegmentIndex(),
-								segmentValue },
-							2, null);
+				program.getRelocationTable().add(relocAddr, Status.APPLIED, 0,
+					new long[] { reloc.getOffset(), reloc.getSegmentIndex(), segmentValue },
+					2, null);
 			}
 			catch (MemoryAccessException | AddressOutOfBoundsException e) {
 				log.appendMsg(String.format(
@@ -376,39 +358,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 	}
 
-	private void seedOverlayEntryPoints(Program program,
-			List<OverlayBlockInfo> overlayBlocks, RTLinkFunctionDirectory directory,
-			MessageLog log) {
-		SymbolTable symbolTable = program.getSymbolTable();
-		int count = 0;
-
-		for (int i = 0; i < directory.getEntryCount(); i++) {
-			RTLinkFunctionDirectory.DirectoryEntry entry = directory.getEntry(i);
-			if (entry == null || entry.pageNumber() == 0) {
-				continue;
-			}
-			int blockIndex = entry.pageNumber() - 1;
-			if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
-				continue;
-			}
-			OverlayBlockInfo info = overlayBlocks.get(blockIndex);
-			Address funcAddr = info.block().getStart().add(entry.offsetInPage());
-			if (info.block().contains(funcAddr)) {
-				labelAddress(symbolTable,
-					String.format("OVL%02d_%04X", entry.pageNumber(), entry.offsetInPage()),
-					funcAddr);
-				symbolTable.addExternalEntryPoint(funcAddr);
-				count++;
-			}
-		}
-
-		Msg.info(this, "RTLink/Plus: Seeded " + count + " overlay entry points");
-	}
-
 	private void discoverAndProcessStubs(Program program,
-			List<OverlayBlockInfo> overlayBlocks, RTLinkFunctionDirectory directory,
-			MessageLog log, TaskMonitor monitor) throws CancelledException {
-		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, directory, log, monitor);
+			List<OverlayBlockInfo> overlayBlocks, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, log, monitor);
 		int int3fStubs = 0;
 
 		if (jmpfStubs == 0) {
@@ -425,13 +378,21 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * Scan for JMPF instructions (opcode EA) with segment 0x0000.
-	 * Pattern: EA xx xx 00 00  (far jump to 0000:xxxx)
+	 * Scan for 0DAB dispatch stubs by finding JMPF instructions with segment 0x0000,
+	 * then validating that a CALLF to offset 0x0DAB precedes them.
+	 * <p>
+	 * Stub layout (14 bytes):
+	 * <pre>
+	 *   [0-4]   9A AB 0D ss ss   CALLF seg:0DAB
+	 *   [5-9]   EA oo oo 00 00   JMPF 0000:offset
+	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based page number)
+	 *   [12-13] dd dd             seg_delta
+	 * </pre>
+	 * The page number is read directly from the stub bytes — no lookup table needed.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
-			RTLinkFunctionDirectory directory, MessageLog log, TaskMonitor monitor)
-			throws CancelledException {
-		if (directory == null || directory.getEntryCount() == 0) {
+			MessageLog log, TaskMonitor monitor) throws CancelledException {
+		if (overlayBlocks.isEmpty()) {
 			return 0;
 		}
 
@@ -453,54 +414,72 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				monitor.checkCancelled();
 
 				searchAddr = memory.findBytes(searchAddr, blockEnd,
-					new byte[] { (byte) 0xEA }, null, true, monitor);
+					new byte[] { OPCODE_JMPF }, null, true, monitor);
 				if (searchAddr == null) {
 					break;
 				}
 
 				try {
-					Address offAddr = searchAddr.add(1);
-					Address segAddr = searchAddr.add(3);
+					// Need 5 bytes before (CALLF) and 7 bytes after (JMPF + page_id)
+					Address callfAddr = searchAddr.subtract(5);
+					Address pageIdAddr = searchAddr.add(5);
 
-					if (!block.contains(segAddr.add(1))) {
+					if (!block.contains(callfAddr) ||
+						!block.contains(pageIdAddr.add(1))) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
 
-					int virtualOffset = Short.toUnsignedInt(memory.getShort(offAddr));
-					int targetSegment = Short.toUnsignedInt(memory.getShort(segAddr));
-
-					if (targetSegment == 0x0000 && virtualOffset > 0) {
-						RTLinkFunctionDirectory.DirectoryEntry entry =
-							directory.resolve(virtualOffset);
-
-						if (entry != null) {
-							OverlayBlockInfo target = resolveStubTarget(
-								entry, overlayBlocks);
-
-							if (target != null) {
-								Address targetAddr =
-									target.block().getStart().add(entry.offsetInPage());
-
-								if (target.block().contains(targetAddr)) {
-									refManager.addMemoryReference(searchAddr, targetAddr,
-										RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
-
-									int pageNum = entry.pageNumber();
-									labelAddress(symbolTable,
-										String.format("OVLSTUB_%02d_%04X",
-											pageNum, entry.offsetInPage()),
-										searchAddr);
-									labelAddress(symbolTable,
-										String.format("OVL%02d_%04X",
-											pageNum, entry.offsetInPage()),
-										targetAddr);
-									createThunkAtStub(funcMgr, searchAddr, targetAddr, 5);
-									count++;
-								}
-							}
-						}
+					int targetSegment =
+						Short.toUnsignedInt(memory.getShort(searchAddr.add(3)));
+					if (targetSegment != 0x0000) {
+						searchAddr = searchAddr.add(1);
+						continue;
 					}
+
+					// Validate CALLF opcode and dispatch offset (0x0DAB)
+					byte callfOpcode = memory.getByte(callfAddr);
+					int callfOffset =
+						Short.toUnsignedInt(memory.getShort(callfAddr.add(1)));
+					if (callfOpcode != OPCODE_CALLF ||
+						callfOffset != RTLINK_DISPATCH_OFFSET) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					int targetOffset =
+						Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
+					int pageId = Short.toUnsignedInt(memory.getShort(pageIdAddr));
+					int pageNumber = pageId & PAGE_ID_MASK;
+
+					int blockIndex = pageNumber - 1;
+					if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					OverlayBlockInfo target = overlayBlocks.get(blockIndex);
+					Address targetAddr = target.block().getStart().add(targetOffset);
+
+					if (!target.block().contains(targetAddr)) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					Address stubAddr = callfAddr;
+					refManager.addMemoryReference(stubAddr, targetAddr,
+						RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
+
+					labelAddress(symbolTable,
+						String.format("OVLSTUB_%02d_%04X", pageNumber, targetOffset),
+						stubAddr);
+					labelAddress(symbolTable,
+						String.format("OVL%02d_%04X", pageNumber, targetOffset),
+						targetAddr);
+
+					symbolTable.addExternalEntryPoint(targetAddr);
+					createThunkAtStub(funcMgr, stubAddr, targetAddr, 14);
+					count++;
 				}
 				catch (MemoryAccessException | AddressOutOfBoundsException e) {
 					// skip
@@ -514,7 +493,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	/**
 	 * Scan for INT 3Fh (CD 3F) stubs used by older RTLink versions.
-	 * Pattern: CD 3F xx xx yy yy  (INT 3Fh, overlay_id, offset)
+	 * Pattern: CD 3F xx xx yy yy (INT 3Fh, overlay_id, offset)
 	 */
 	private int scanForInt3fStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
 			MessageLog log, TaskMonitor monitor) throws CancelledException {
@@ -536,8 +515,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			while (searchAddr != null && searchAddr.compareTo(blockEnd) < 0) {
 				monitor.checkCancelled();
 
-				searchAddr = memory.findBytes(searchAddr, blockEnd,
-					pattern, null, true, monitor);
+				searchAddr = memory.findBytes(searchAddr, blockEnd, pattern, null, true,
+					monitor);
 				if (searchAddr == null) {
 					break;
 				}
@@ -556,7 +535,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 					if (overlayId < overlayBlocks.size()) {
 						OverlayBlockInfo info = overlayBlocks.get(overlayId);
-						Address targetAddr = info.block().getStart().add(targetOffset);
+						Address targetAddr =
+							info.block().getStart().add(targetOffset);
 
 						if (info.block().contains(targetAddr)) {
 							refManager.addMemoryReference(searchAddr, targetAddr,
@@ -564,13 +544,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 							int pageNum = info.page().getPageIndex() - 1;
 							labelAddress(symbolTable,
-								String.format("OVLSTUB_%02d_%04X",
-									pageNum, targetOffset),
+								String.format("OVLSTUB_%02d_%04X", pageNum,
+									targetOffset),
 								searchAddr);
 							labelAddress(symbolTable,
-								String.format("OVL%02d_%04X",
-									pageNum, targetOffset),
+								String.format("OVL%02d_%04X", pageNum, targetOffset),
 								targetAddr);
+
+							symbolTable.addExternalEntryPoint(targetAddr);
 							createThunkAtStub(funcMgr, searchAddr, targetAddr, 6);
 							count++;
 						}
@@ -584,16 +565,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 		}
 		return count;
-	}
-
-	private OverlayBlockInfo resolveStubTarget(
-			RTLinkFunctionDirectory.DirectoryEntry entry,
-			List<OverlayBlockInfo> overlayBlocks) {
-		int blockIndex = entry.pageNumber() - 1;
-		if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
-			return null;
-		}
-		return overlayBlocks.get(blockIndex);
 	}
 
 	private static void createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
@@ -620,9 +591,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 		else {
 			try {
-				AddressSet stubBody = new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
-				funcMgr.createThunkFunction(null, null, stubAddr,
-					stubBody, overlayFunc, SourceType.ANALYSIS);
+				AddressSet stubBody =
+					new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
+				funcMgr.createThunkFunction(null, null, stubAddr, stubBody,
+					overlayFunc, SourceType.ANALYSIS);
 			}
 			catch (OverlappingFunctionException e) {
 				// ignore
@@ -654,8 +626,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			MemoryBlock headerBlock = MemoryBlockUtils.createInitializedBlock(program, true,
 				name, headerBase, fileBytes, page.getFileOffset(), headerAndRelocSize,
-				"RTLink page " + page.getPageIndex() + " header",
-				"RTLink", false, false, false, log);
+				"RTLink page " + page.getPageIndex() + " header", "RTLink",
+				false, false, false, log);
 
 			if (headerBlock == null) {
 				continue;
@@ -663,8 +635,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			try {
 				Address addr = headerBlock.getStart();
-				DataUtilities.createData(program, addr,
-					page.getHeader().toDataType(), -1,
+				DataUtilities.createData(program, addr, page.getHeader().toDataType(), -1,
 					DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
 
 				if (!page.getRelocations().isEmpty()) {
@@ -673,14 +644,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					Address relocAddr = addr.add(RTLinkPageHeader.HEADER_SIZE);
 					for (int j = 0; j < page.getRelocations().size(); j++) {
 						monitor.checkCancelled();
-						DataUtilities.createData(program, relocAddr.add((long) j * relocSize),
-							relocType, -1, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
+						DataUtilities.createData(program,
+							relocAddr.add((long) j * relocSize), relocType, -1,
+							DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
 					}
 				}
 			}
 			catch (Exception e) {
-				log.appendMsg("RTLink: Failed to markup header for page " +
-					page.getPageIndex());
+				log.appendMsg(
+					"RTLink: Failed to markup header for page " + page.getPageIndex());
 			}
 		}
 	}
