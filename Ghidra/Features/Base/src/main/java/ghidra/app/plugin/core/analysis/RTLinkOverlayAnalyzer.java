@@ -51,10 +51,12 @@ import ghidra.util.task.TaskMonitor;
  * segment relocations, and wires cross-references from dispatch stubs to
  * overlay functions.
  * <p>
- * Dispatch stubs are 14-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
- * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes) + seg_delta (2 bytes).
- * The page number is embedded directly in the stub — bits 0-13 of page_id give
- * the 1-based overlay page number.
+ * Dispatch stubs are 12-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
+ * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes). Bits 0-13 of page_id
+ * hold a 1-based descriptor index into the overlay descriptor table; index 1 is
+ * the global overlay table, so the first code page is index 2 (the 1-based
+ * overlay page number is therefore page_id - 1). The JMPF offset is the in-page
+ * code offset.
  */
 public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
@@ -258,6 +260,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		SegmentedAddressSpace space =
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 		Address overlayBase = space.getAddress(INITIAL_SEGMENT_VAL, 0);
+		long fileSize = fileBytes.getSize();
 
 		for (RTLinkOverlayPage page : codePages) {
 			monitor.checkCancelled();
@@ -269,10 +272,25 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				continue;
 			}
 
+			// The final page's header-declared (paragraph-rounded) code size can run a
+			// few bytes past the physical end of file, because the image is not padded
+			// to a full paragraph. Clamp to the bytes actually present so block creation
+			// does not read past FileBytes.
+			long codeFileOffset = page.getCodeFileOffset();
+			long available = fileSize - codeFileOffset;
+			if (available <= 0) {
+				log.appendMsg("RTLink: Overlay page " + page.getPageIndex() +
+					" code starts past end of file, skipping");
+				continue;
+			}
+			if (codeSize > available) {
+				codeSize = (int) available;
+			}
+
 			String blockName = String.format("OVERLAY_%02d", page.getPageIndex() - 1);
 
 			MemoryBlock block = MemoryBlockUtils.createInitializedBlock(program, true,
-				blockName, overlayBase, fileBytes, page.getCodeFileOffset(), codeSize,
+				blockName, overlayBase, fileBytes, codeFileOffset, codeSize,
 				String.format("RTLink/Plus overlay page %d (frame=0x%X)",
 					page.getPageIndex() - 1, page.getFrameSize()),
 				"RTLink", true, false, true, log);
@@ -381,14 +399,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * Scan for 0DAB dispatch stubs by finding JMPF instructions with segment 0x0000,
 	 * then validating that a CALLF to offset 0x0DAB precedes them.
 	 * <p>
-	 * Stub layout (14 bytes):
+	 * Stub layout (12 bytes):
 	 * <pre>
 	 *   [0-4]   9A AB 0D ss ss   CALLF seg:0DAB
 	 *   [5-9]   EA oo oo 00 00   JMPF 0000:offset
-	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based page number)
-	 *   [12-13] dd dd             seg_delta
+	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based descriptor index)
 	 * </pre>
-	 * The page number is read directly from the stub bytes — no lookup table needed.
+	 * page_id is a descriptor index in which 1 is the global overlay table, so the
+	 * first code page is index 2; the 1-based overlay page number is page_id - 1.
+	 * The JMPF offset is the in-page code offset. No external lookup table is needed.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
 			MessageLog log, TaskMonitor monitor) throws CancelledException {
@@ -450,7 +469,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					int targetOffset =
 						Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
 					int pageId = Short.toUnsignedInt(memory.getShort(pageIdAddr));
-					int pageNumber = pageId & PAGE_ID_MASK;
+					// The stored value is a 1-based descriptor index, NOT the overlay page
+					// number: descriptor index 1 is the global overlay table, so the first
+					// code page is index 2. Convert to a 1-based code-page number (used in
+					// the OVLxx label convention) and a 0-based index into overlayBlocks
+					// (which already excludes the global table at subList(1, ...)).
+					int descriptorIndex = pageId & PAGE_ID_MASK;
+					int pageNumber = descriptorIndex - 1;
 
 					int blockIndex = pageNumber - 1;
 					if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
@@ -478,7 +503,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						targetAddr);
 
 					symbolTable.addExternalEntryPoint(targetAddr);
-					createThunkAtStub(funcMgr, stubAddr, targetAddr, 14);
+					createThunkAtStub(funcMgr, stubAddr, targetAddr, 12);
 					count++;
 				}
 				catch (MemoryAccessException | AddressOutOfBoundsException e) {
