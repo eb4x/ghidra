@@ -122,7 +122,17 @@ public class RTLinkOverlayPage {
 					break;
 				}
 				int totalSize = page.getHeader().getTotalSizeBytes();
-				if (totalSize <= 0 || cursor + totalSize > fileLength) {
+				if (totalSize <= 0) {
+					break;
+				}
+				// The final page's paragraph-rounded total size can extend a few bytes
+				// past the physical end of file, because the image is not padded to a
+				// full paragraph. Accept such a final page as long as its overhead
+				// (header + relocations) fits and at least one code byte is present; the
+				// code size is clamped when the memory block is created. Only bail out
+				// if even the overhead does not fit within the file.
+				if (cursor + totalSize > fileLength &&
+					cursor + page.getHeader().getOverheadSizeBytes() >= fileLength) {
 					break;
 				}
 				pages.add(page);
