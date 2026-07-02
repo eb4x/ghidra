@@ -18,7 +18,11 @@ package ghidra.app.plugin.core.analysis;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
@@ -73,8 +77,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	private static final byte OPCODE_CALLF = (byte) 0x9A;
 	private static final byte OPCODE_JMPF = (byte) 0xEA;
-	private static final int RTLINK_DISPATCH_OFFSET = 0x0DAB;
 	private static final int PAGE_ID_MASK = 0x3FFF;
+
+	// A real overlay dispatcher is the CALLF target shared by many stubs. Any
+	// physical address hit by at least this many CALLF+JMPF stub candidates is
+	// treated as a dispatcher, replacing the old hardcoded 0x0DAB dispatch offset
+	// so the analyzer adapts to binaries linked with the dispatcher elsewhere.
+	private static final int MIN_DISPATCHER_STUB_COUNT = 4;
 
 	private static final String OPTION_APPLY_RELOCS = "Apply Relocations";
 	private static final String OPTION_CREATE_XREFS = "Create Stub Cross-References";
@@ -388,8 +397,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		AddressSet overlayEntryPoints = new AddressSet();
 		List<StubTarget> pendingThunks = new ArrayList<>();
 
-		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, overlayEntryPoints,
-			pendingThunks, log, monitor);
+		Set<Long> dispatchers = discoverDispatchers(program, monitor);
+		if (!dispatchers.isEmpty()) {
+			Msg.info(this, "RTLink/Plus: Discovered " + dispatchers.size() +
+				" overlay dispatcher entry point(s)");
+		}
+
+		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, dispatchers,
+			overlayEntryPoints, pendingThunks, log, monitor);
 		int int3fStubs = 0;
 
 		if (jmpfStubs == 0) {
@@ -414,10 +429,71 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		FunctionManager funcMgr = program.getFunctionManager();
 		for (StubTarget stub : pendingThunks) {
 			monitor.checkCancelled();
-			createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize());
+			createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(), log);
 		}
 
 		Msg.info(this, "RTLink/Plus: Resolved " + total + " dispatch stubs");
+	}
+
+	/**
+	 * Discover overlay dispatcher entry points instead of hardcoding one offset.
+	 * <p>
+	 * Every dispatch stub begins with {@code CALLF seg:disp} immediately followed by
+	 * {@code JMPF ...}. The dispatcher is therefore the CALLF target shared by a large
+	 * number of such CALLF+JMPF pairs. This scans every executable non-overlay block,
+	 * tallies the physical CALLF target of each candidate pair, and returns those hit at
+	 * least {@link #MIN_DISPATCHER_STUB_COUNT} times. Keying on the physical (flat)
+	 * address collapses the many segment:offset aliases that resolve to one dispatcher.
+	 */
+	private Set<Long> discoverDispatchers(Program program, TaskMonitor monitor)
+			throws CancelledException {
+		Memory memory = program.getMemory();
+		SegmentedAddressSpace space =
+			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+		Map<Long, Integer> counts = new HashMap<>();
+
+		for (MemoryBlock block : memory.getBlocks()) {
+			if (block.isOverlay() || !block.isExecute() || !block.isInitialized()) {
+				continue;
+			}
+
+			Address searchAddr = block.getStart();
+			Address blockEnd = block.getEnd();
+
+			while (searchAddr != null && searchAddr.compareTo(blockEnd) < 0) {
+				monitor.checkCancelled();
+
+				searchAddr = memory.findBytes(searchAddr, blockEnd,
+					new byte[] { OPCODE_CALLF }, null, true, monitor);
+				if (searchAddr == null) {
+					break;
+				}
+
+				try {
+					Address jmpfAddr = searchAddr.add(5);
+					if (block.contains(jmpfAddr) &&
+						memory.getByte(jmpfAddr) == OPCODE_JMPF) {
+						int off = Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
+						int seg = Short.toUnsignedInt(memory.getShort(searchAddr.add(3)));
+						long target = space.getAddress(seg, off).getOffset();
+						counts.merge(target, 1, Integer::sum);
+					}
+				}
+				catch (MemoryAccessException | AddressOutOfBoundsException e) {
+					// skip
+				}
+
+				searchAddr = searchAddr.add(1);
+			}
+		}
+
+		Set<Long> dispatchers = new HashSet<>();
+		for (Map.Entry<Long, Integer> e : counts.entrySet()) {
+			if (e.getValue() >= MIN_DISPATCHER_STUB_COUNT) {
+				dispatchers.add(e.getKey());
+			}
+		}
+		return dispatchers;
 	}
 
 	/**
@@ -463,12 +539,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * Scan for 0DAB dispatch stubs by finding JMPF instructions with segment 0x0000,
-	 * then validating that a CALLF to offset 0x0DAB precedes them.
+	 * Scan for dispatch stubs by finding JMPF instructions with segment 0x0000, then
+	 * validating that a CALLF to a {@link #discoverDispatchers discovered dispatcher}
+	 * precedes them.
 	 * <p>
 	 * Stub layout (12 bytes):
 	 * <pre>
-	 *   [0-4]   9A AB 0D ss ss   CALLF seg:0DAB
+	 *   [0-4]   9A oo oo ss ss   CALLF seg:disp   (seg:disp resolves to a dispatcher)
 	 *   [5-9]   EA oo oo 00 00   JMPF 0000:offset
 	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based descriptor index)
 	 * </pre>
@@ -477,15 +554,18 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * The JMPF offset is the in-page code offset. No external lookup table is needed.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
-			AddressSet overlayEntryPoints, List<StubTarget> pendingThunks,
-			MessageLog log, TaskMonitor monitor) throws CancelledException {
-		if (overlayBlocks.isEmpty()) {
+			Set<Long> dispatchers, AddressSet overlayEntryPoints,
+			List<StubTarget> pendingThunks, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		if (overlayBlocks.isEmpty() || dispatchers.isEmpty()) {
 			return 0;
 		}
 
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
+		SegmentedAddressSpace space =
+			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 		int count = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
@@ -523,12 +603,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						continue;
 					}
 
-					// Validate CALLF opcode and dispatch offset (0x0DAB)
+					// Validate CALLF opcode and that it targets a discovered dispatcher.
 					byte callfOpcode = memory.getByte(callfAddr);
 					int callfOffset =
 						Short.toUnsignedInt(memory.getShort(callfAddr.add(1)));
-					if (callfOpcode != OPCODE_CALLF ||
-						callfOffset != RTLINK_DISPATCH_OFFSET) {
+					int callfSegment =
+						Short.toUnsignedInt(memory.getShort(callfAddr.add(3)));
+					long callfTarget = space.getAddress(callfSegment, callfOffset).getOffset();
+					if (callfOpcode != OPCODE_CALLF || !dispatchers.contains(callfTarget)) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
@@ -569,7 +651,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						String.format("OVL%02d_%04X", pageNumber, targetOffset),
 						targetAddr);
 
-					symbolTable.addExternalEntryPoint(targetAddr);
 					overlayEntryPoints.add(targetAddr);
 					pendingThunks.add(new StubTarget(stubAddr, targetAddr, 12));
 					count++;
@@ -644,7 +725,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 								String.format("OVL%02d_%04X", pageNum, targetOffset),
 								targetAddr);
 
-							symbolTable.addExternalEntryPoint(targetAddr);
 							overlayEntryPoints.add(targetAddr);
 							pendingThunks.add(new StubTarget(searchAddr, targetAddr, 6));
 							count++;
@@ -662,7 +742,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	private static void createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
-			Address targetAddr, int stubSize) {
+			Address targetAddr, int stubSize, MessageLog log) {
 		Function overlayFunc = funcMgr.getFunctionAt(targetAddr);
 		if (overlayFunc == null) {
 			try {
@@ -676,23 +756,36 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		Function existingStub = funcMgr.getFunctionAt(stubAddr);
 		if (existingStub != null) {
+			// Already the correct thunk (e.g. a re-run) — nothing to do.
+			if (existingStub.isThunk() &&
+				overlayFunc.equals(existingStub.getThunkedFunction(false))) {
+				return;
+			}
 			try {
 				existingStub.setThunkedFunction(overlayFunc);
+				return;
 			}
 			catch (IllegalArgumentException e) {
-				// ignore
+				// A plain function was already carved at the stub (auto-analysis
+				// reaches it from a real CALLF before we run) and cannot be
+				// converted in place. Remove it and recreate below as a thunk so
+				// the stub still forwards to its overlay target.
+				log.appendMsg(String.format(
+					"RTLink: recreating stub thunk at %s -> %s (%s)",
+					stubAddr, targetAddr, e.getMessage()));
+				funcMgr.removeFunction(stubAddr);
 			}
 		}
-		else {
-			try {
-				AddressSet stubBody =
-					new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
-				funcMgr.createThunkFunction(null, null, stubAddr, stubBody,
-					overlayFunc, SourceType.ANALYSIS);
-			}
-			catch (OverlappingFunctionException e) {
-				// ignore
-			}
+
+		try {
+			AddressSet stubBody = new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
+			funcMgr.createThunkFunction(null, null, stubAddr, stubBody,
+				overlayFunc, SourceType.ANALYSIS);
+		}
+		catch (OverlappingFunctionException e) {
+			log.appendMsg(String.format(
+				"RTLink: could not create stub thunk at %s -> %s: %s",
+				stubAddr, targetAddr, e.getMessage()));
 		}
 	}
 
