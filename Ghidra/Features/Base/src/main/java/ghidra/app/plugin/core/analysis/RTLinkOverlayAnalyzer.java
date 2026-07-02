@@ -20,6 +20,8 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.services.*;
 import ghidra.app.util.MemoryBlockUtils;
 import ghidra.app.util.bin.BinaryReader;
@@ -206,6 +208,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private record OverlayBlockInfo(RTLinkOverlayPage page, MemoryBlock block) {
 	}
 
+	/** A resolved dispatch stub awaiting thunk creation once its target is a real function. */
+	private record StubTarget(Address stubAddr, Address targetAddr, int stubSize) {
+	}
+
 	private static boolean isAlreadyAnalyzed(Program program) {
 		return program.getOptions(Program.PROGRAM_INFO).getBoolean(ANALYZED_FLAG, false);
 	}
@@ -379,20 +385,81 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private void discoverAndProcessStubs(Program program,
 			List<OverlayBlockInfo> overlayBlocks, MessageLog log, TaskMonitor monitor)
 			throws CancelledException {
-		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, log, monitor);
+		AddressSet overlayEntryPoints = new AddressSet();
+		List<StubTarget> pendingThunks = new ArrayList<>();
+
+		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, overlayEntryPoints,
+			pendingThunks, log, monitor);
 		int int3fStubs = 0;
 
 		if (jmpfStubs == 0) {
-			int3fStubs = scanForInt3fStubs(program, overlayBlocks, log, monitor);
+			int3fStubs = scanForInt3fStubs(program, overlayBlocks, overlayEntryPoints,
+				pendingThunks, log, monitor);
 		}
 
 		int total = jmpfStubs + int3fStubs;
-		if (total > 0) {
-			Msg.info(this, "RTLink/Plus: Resolved " + total + " dispatch stubs");
-		}
-		else {
+		if (total == 0) {
 			log.appendMsg("RTLink: No dispatch stubs found");
+			return;
 		}
+
+		// Disassemble the overlay code reachable from the resolved entry points and
+		// promote each entry point to a function with a real body. Without this the
+		// overlay pages hold no instructions, so intra-overlay calls and jumps never
+		// get references and every overlay "function" is a one-byte husk.
+		disassembleOverlayCode(program, overlayBlocks, overlayEntryPoints, log, monitor);
+
+		// Now that the overlay targets are real functions, wire each dispatch stub to
+		// its target as a thunk.
+		FunctionManager funcMgr = program.getFunctionManager();
+		for (StubTarget stub : pendingThunks) {
+			monitor.checkCancelled();
+			createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize());
+		}
+
+		Msg.info(this, "RTLink/Plus: Resolved " + total + " dispatch stubs");
+	}
+
+	/**
+	 * Disassemble overlay code starting from the resolved stub entry points, following
+	 * intra-page flow but staying within the overlay blocks, then create a function with
+	 * a computed body at each entry point.
+	 * <p>
+	 * This is what makes overlay code visible to the rest of Ghidra: the disassembler
+	 * creates flow references for the near calls and jumps between overlay routines (which
+	 * {@code OperandReferenceAnalyzer} never creates for 16-bit spaces), and the follow-on
+	 * far-call analyzer then wires overlay-to-main references.
+	 */
+	private void disassembleOverlayCode(Program program, List<OverlayBlockInfo> overlayBlocks,
+			AddressSet overlayEntryPoints, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		if (overlayEntryPoints.isEmpty()) {
+			return;
+		}
+
+		AddressSet overlayRange = new AddressSet();
+		for (OverlayBlockInfo info : overlayBlocks) {
+			overlayRange.add(info.block().getStart(), info.block().getEnd());
+		}
+
+		monitor.setMessage("RTLink: Disassembling overlay code...");
+		DisassembleCommand disCmd =
+			new DisassembleCommand(overlayEntryPoints, overlayRange, true);
+		if (!disCmd.applyTo(program, monitor)) {
+			log.appendMsg("RTLink: Overlay disassembly reported: " + disCmd.getStatusMsg());
+		}
+		monitor.checkCancelled();
+
+		monitor.setMessage("RTLink: Creating overlay functions...");
+		CreateFunctionCmd funcCmd =
+			new CreateFunctionCmd(overlayEntryPoints, SourceType.ANALYSIS);
+		funcCmd.applyTo(program, monitor);
+
+		AddressSetView disassembled = disCmd.getDisassembledAddressSet();
+		long byteCount = disassembled == null ? 0 : disassembled.getNumAddresses();
+		Msg.info(this, String.format(
+			"RTLink/Plus: Disassembled %d overlay byte(s) from %d entry point(s)",
+			byteCount, overlayEntryPoints.getNumAddresses()));
 	}
 
 	/**
@@ -410,6 +477,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * The JMPF offset is the in-page code offset. No external lookup table is needed.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
+			AddressSet overlayEntryPoints, List<StubTarget> pendingThunks,
 			MessageLog log, TaskMonitor monitor) throws CancelledException {
 		if (overlayBlocks.isEmpty()) {
 			return 0;
@@ -418,7 +486,6 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
-		FunctionManager funcMgr = program.getFunctionManager();
 		int count = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
@@ -503,7 +570,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						targetAddr);
 
 					symbolTable.addExternalEntryPoint(targetAddr);
-					createThunkAtStub(funcMgr, stubAddr, targetAddr, 12);
+					overlayEntryPoints.add(targetAddr);
+					pendingThunks.add(new StubTarget(stubAddr, targetAddr, 12));
 					count++;
 				}
 				catch (MemoryAccessException | AddressOutOfBoundsException e) {
@@ -521,11 +589,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * Pattern: CD 3F xx xx yy yy (INT 3Fh, overlay_id, offset)
 	 */
 	private int scanForInt3fStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
+			AddressSet overlayEntryPoints, List<StubTarget> pendingThunks,
 			MessageLog log, TaskMonitor monitor) throws CancelledException {
 		Memory memory = program.getMemory();
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
-		FunctionManager funcMgr = program.getFunctionManager();
 		byte[] pattern = { (byte) 0xCD, (byte) 0x3F };
 		int count = 0;
 
@@ -577,7 +645,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 								targetAddr);
 
 							symbolTable.addExternalEntryPoint(targetAddr);
-							createThunkAtStub(funcMgr, searchAddr, targetAddr, 6);
+							overlayEntryPoints.add(targetAddr);
+							pendingThunks.add(new StubTarget(searchAddr, targetAddr, 6));
 							count++;
 						}
 					}
