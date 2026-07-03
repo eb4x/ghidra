@@ -4,6 +4,7 @@
 
 ```bash
 sudo dnf install java-21-openjdk-devel java-21-openjdk-jmods
+sudo dnf group install c-development
 ```
 
 - `java-21-openjdk-devel` — provides `javac` and other compiler tools
