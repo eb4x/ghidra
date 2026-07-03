@@ -77,12 +77,16 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		"Detects and loads RTLink/Plus overlay pages from DOS MZ executables. " +
 			"Creates overlay memory blocks, applies segment relocations, and " +
 			"creates cross-references from dispatch stubs to overlay functions.";
-	private static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
+	/**
+	 * PROGRAM_INFO property set when overlay analysis completes; gates
+	 * {@link RTLinkOverlayXrefAnalyzer}.
+	 */
+	static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
 
 	private static final int INITIAL_SEGMENT_VAL = 0x1000;
 
-	private static final byte OPCODE_CALLF = (byte) 0x9A;
-	private static final byte OPCODE_JMPF = (byte) 0xEA;
+	static final byte OPCODE_CALLF = (byte) 0x9A;
+	static final byte OPCODE_JMPF = (byte) 0xEA;
 	private static final int PAGE_ID_MASK = 0x3FFF;
 
 	// A real overlay dispatcher is the CALLF target shared by many stubs. Any
@@ -109,6 +113,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	@Override
 	public boolean canAnalyze(Program program) {
+		return isSegmentedMzProgram(program);
+	}
+
+	/**
+	 * Returns true if {@code program} is an MZ executable with a segmented (16-bit
+	 * real mode) default address space — the only programs RTLink overlay analysis
+	 * applies to.
+	 */
+	static boolean isSegmentedMzProgram(Program program) {
 		if (!MzLoader.MZ_NAME.equals(program.getExecutableFormat())) {
 			return false;
 		}
@@ -125,7 +138,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 		lastTxId = txId;
 
-		if (isAlreadyAnalyzed(program)) {
+		if (isOverlayAnalyzed(program)) {
 			return true;
 		}
 
@@ -227,7 +240,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private record StubTarget(Address stubAddr, Address targetAddr, int stubSize) {
 	}
 
-	private static boolean isAlreadyAnalyzed(Program program) {
+	static boolean isOverlayAnalyzed(Program program) {
 		return program.getOptions(Program.PROGRAM_INFO).getBoolean(ANALYZED_FLAG, false);
 	}
 
@@ -337,7 +350,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 		}
 
-		Msg.info(this, "RTLink/Plus: Created " + result.size() + " overlay memory blocks");
+		Msg.debug(this, "RTLink/Plus: Created " + result.size() + " overlay memory blocks");
 		return result;
 	}
 
@@ -387,7 +400,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		Set<Long> dispatchers = discoverDispatchers(program, monitor);
 		if (!dispatchers.isEmpty()) {
-			Msg.info(this, "RTLink/Plus: Discovered " + dispatchers.size() +
+			Msg.debug(this, "RTLink/Plus: Discovered " + dispatchers.size() +
 				" overlay dispatcher entry point(s)");
 		}
 
@@ -521,7 +534,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		AddressSetView disassembled = disCmd.getDisassembledAddressSet();
 		long byteCount = disassembled == null ? 0 : disassembled.getNumAddresses();
-		Msg.info(this, String.format(
+		Msg.debug(this, String.format(
 			"RTLink/Plus: Disassembled %d overlay byte(s) from %d entry point(s)",
 			byteCount, overlayEntryPoints.getNumAddresses()));
 	}
@@ -685,7 +698,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 		}
 		if (moduleResolved > 0) {
-			Msg.info(this, "RTLink/Plus: " + moduleResolved +
+			Msg.debug(this, "RTLink/Plus: " + moduleResolved +
 				" stub(s) resolved through a nonzero module base");
 		}
 		return count;
