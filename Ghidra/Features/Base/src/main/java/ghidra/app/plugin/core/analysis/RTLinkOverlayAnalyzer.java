@@ -332,8 +332,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		// The runtime fixup loop (210d:2e59 in VICEROY.EXE) addresses each patch
 		// site as (frame + seg_index):offset — page-linear seg_index*16 + offset —
 		// and adds the same load delta to the unrelocated segment word found there,
-		// regardless of seg_index. Mirror that with the image base as the delta.
-		int loadDelta = (int) (program.getImageBase().getOffset() >>> 4);
+		// regardless of seg_index. The delta is the segment the resident image was
+		// loaded at: MzLoader bases it at INITIAL_SEGMENT_VAL without setting the
+		// program image base, so getImageBase() would yield 0 here.
+		int loadDelta = INITIAL_SEGMENT_VAL;
 
 		for (RTLinkRelocation reloc : page.getRelocations()) {
 			int siteOffset = reloc.getSiteOffset();
