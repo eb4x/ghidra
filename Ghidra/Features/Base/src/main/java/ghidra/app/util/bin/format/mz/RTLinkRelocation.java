@@ -26,9 +26,14 @@ import ghidra.util.exception.DuplicateNameException;
  * A single 4-byte RTLink/Plus overlay relocation entry.
  *
  * <pre>
- * uint16 offset;    // offset within the overlay code to patch
- * uint16 seg_index; // segment index (0 = data segment)
+ * uint16 offset;    // site offset, relative to paragraph seg_index of the page code
+ * uint16 seg_index; // paragraph (16-byte unit) index within the page code
  * </pre>
+ *
+ * The patched word lives at page-linear byte offset {@code seg_index * 16 + offset}
+ * (see {@link #getSiteOffset()}). The runtime fixup loop adds the same load delta to
+ * the unrelocated segment word at every site, regardless of seg_index — seg_index
+ * only relocates the site address, it never selects a different fixup value.
  */
 public class RTLinkRelocation implements StructConverter {
 
@@ -49,7 +54,7 @@ public class RTLinkRelocation implements StructConverter {
 	}
 
 	/**
-	 * Gets the offset within the overlay code where the fixup is applied
+	 * Gets the site offset, relative to paragraph {@code seg_index} of the page code
 	 *
 	 * @return The offset
 	 */
@@ -58,8 +63,8 @@ public class RTLinkRelocation implements StructConverter {
 	}
 
 	/**
-	 * Gets the segment index indicating what type of segment reference this is.
-	 * Index 0 typically refers to the data segment.
+	 * Gets the paragraph (16-byte unit) index within the page code that the offset
+	 * is relative to
 	 *
 	 * @return The segment index
 	 */
@@ -67,11 +72,21 @@ public class RTLinkRelocation implements StructConverter {
 		return segIndex;
 	}
 
+	/**
+	 * Gets the page-linear byte offset of the patched word:
+	 * {@code seg_index * 16 + offset}
+	 *
+	 * @return The fixup site offset within the page code
+	 */
+	public int getSiteOffset() {
+		return segIndex * 16 + offset;
+	}
+
 	@Override
 	public DataType toDataType() throws DuplicateNameException {
 		StructureDataType struct = new StructureDataType(NAME, 0);
-		struct.add(WORD, "offset", "Offset within overlay code to patch");
-		struct.add(WORD, "seg_index", "Segment index (0 = data segment)");
+		struct.add(WORD, "offset", "Site offset, relative to paragraph seg_index of the page code");
+		struct.add(WORD, "seg_index", "Paragraph index within the page code (site = seg_index*16 + offset)");
 		struct.setCategoryPath(new CategoryPath("/DOS/RTLink"));
 		return struct;
 	}
