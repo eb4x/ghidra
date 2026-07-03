@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
@@ -56,12 +57,18 @@ import ghidra.util.task.TaskMonitor;
  * segment relocations, and wires cross-references from dispatch stubs to
  * overlay functions.
  * <p>
- * Dispatch stubs are 12-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
- * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes). Bits 0-13 of page_id
- * hold a 1-based descriptor index into the overlay descriptor table; index 1 is
- * the global overlay table, so the first code page is index 2 (the 1-based
- * overlay page number is therefore page_id - 1). The JMPF offset is the in-page
- * code offset.
+ * Dispatch stubs are 12- or 14-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
+ * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes) + an optional module_word
+ * (2 bytes). Bits 0-13 of page_id hold a 1-based descriptor index into the overlay
+ * descriptor table; index 1 is the global overlay table, so the first code page is
+ * index 2 (the 1-based overlay page number is therefore page_id - 1).
+ * <p>
+ * Pages contain multiple link-time modules, each with its own segment base
+ * (CS = page frame + module base paragraph), so the JMPF offset is
+ * module-relative. 12-byte stubs target module 0 (JMPF offset = in-page code
+ * offset); 14-byte stubs carry the target module's base paragraph in module_word,
+ * and the in-page code offset is {@code JMPF offset + module_word * 16}. See
+ * {@link #scanForJmpfStubs} for how the two forms are told apart.
  */
 public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
@@ -303,11 +310,23 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			String blockName = String.format("OVERLAY_%02d", page.getPageIndex() - 1);
 
+			// Note the module bases known from the relocation table in the block
+			// comment; CS-relative absolute offsets in module code (e.g. switch jump
+			// tables) are relative to these paragraphs, not to the page start.
+			StringBuilder comment = new StringBuilder(
+				String.format("RTLink/Plus overlay page %d (frame=0x%X)",
+					page.getPageIndex() - 1, page.getFrameSize()));
+			SortedSet<Integer> moduleBases = page.getModuleBases();
+			if (moduleBases.size() > 1) {
+				comment.append(", module base paragraphs:");
+				for (int base : moduleBases) {
+					comment.append(String.format(" 0x%X", base));
+				}
+			}
+
 			MemoryBlock block = MemoryBlockUtils.createInitializedBlock(program, true,
 				blockName, overlayBase, fileBytes, codeFileOffset, codeSize,
-				String.format("RTLink/Plus overlay page %d (frame=0x%X)",
-					page.getPageIndex() - 1, page.getFrameSize()),
-				"RTLink", true, false, true, log);
+				comment.toString(), "RTLink", true, false, true, log);
 
 			if (block != null) {
 				result.add(new OverlayBlockInfo(page, block));
@@ -512,15 +531,27 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * validating that a CALLF to a {@link #discoverDispatchers discovered dispatcher}
 	 * precedes them.
 	 * <p>
-	 * Stub layout (12 bytes):
+	 * Stub layout (12 or 14 bytes):
 	 * <pre>
 	 *   [0-4]   9A oo oo ss ss   CALLF seg:disp   (seg:disp resolves to a dispatcher)
 	 *   [5-9]   EA oo oo 00 00   JMPF 0000:offset
 	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based descriptor index)
+	 *   [12-13] mm mm             module_word (14-byte form only)
 	 * </pre>
 	 * page_id is a descriptor index in which 1 is the global overlay table, so the
 	 * first code page is index 2; the 1-based overlay page number is page_id - 1.
-	 * The JMPF offset is the in-page code offset. No external lookup table is needed.
+	 * The JMPF offset is relative to the target module's base paragraph within the
+	 * page: 12-byte stubs target module 0, so it is the in-page code offset directly;
+	 * 14-byte stubs carry the module's base paragraph in module_word, and the in-page
+	 * code offset is JMPF offset + module_word * 16.
+	 * <p>
+	 * Nothing in page_id flags the stub length (bits 14-15 are always clear), so the
+	 * two forms are told apart structurally: if the bytes at +12 begin another
+	 * dispatcher stub (a CALLF whose target is a discovered dispatcher), the stub is
+	 * 12 bytes; otherwise a word at +12 smaller than the page's total paragraph count
+	 * is a module_word. The module_word cannot be validated against the page's
+	 * relocation seg_index values ({@link RTLinkOverlayPage#getModuleBases()}) — a
+	 * module referenced only by stubs never appears there.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
 			Set<Long> dispatchers, AddressSet overlayEntryPoints,
@@ -536,6 +567,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		SegmentedAddressSpace space =
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 		int count = 0;
+		int moduleResolved = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
 			if (block.isOverlay() || !block.isExecute() || !block.isInitialized()) {
@@ -584,7 +616,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						continue;
 					}
 
-					int targetOffset =
+					int jmpfOffset =
 						Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
 					int pageId = Short.toUnsignedInt(memory.getShort(pageIdAddr));
 					// The stored value is a 1-based descriptor index, NOT the overlay page
@@ -602,6 +634,24 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					}
 
 					OverlayBlockInfo target = overlayBlocks.get(blockIndex);
+
+					// Distinguish the 12- and 14-byte stub forms (see the method javadoc):
+					// the bytes at +12 either begin the next stub (12-byte form, module 0)
+					// or hold the target module's base paragraph within the page.
+					int stubSize = 12;
+					int moduleBase = 0;
+					Address moduleWordAddr = callfAddr.add(12);
+					if (block.contains(moduleWordAddr.add(1)) &&
+						!isDispatcherCallf(memory, space, block, dispatchers,
+							moduleWordAddr)) {
+						int word = Short.toUnsignedInt(memory.getShort(moduleWordAddr));
+						if (word < target.page().getHeader().getTotalParagraphs()) {
+							stubSize = 14;
+							moduleBase = word;
+						}
+					}
+					int targetOffset = jmpfOffset + moduleBase * 16;
+
 					Address targetAddr = target.block().getStart().add(targetOffset);
 
 					if (!target.block().contains(targetAddr)) {
@@ -621,7 +671,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						targetAddr);
 
 					overlayEntryPoints.add(targetAddr);
-					pendingThunks.add(new StubTarget(stubAddr, targetAddr, 12));
+					pendingThunks.add(new StubTarget(stubAddr, targetAddr, stubSize));
+					if (moduleBase != 0) {
+						moduleResolved++;
+					}
 					count++;
 				}
 				catch (MemoryAccessException | AddressOutOfBoundsException e) {
@@ -631,7 +684,33 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				searchAddr = searchAddr.add(1);
 			}
 		}
+		if (moduleResolved > 0) {
+			Msg.info(this, "RTLink/Plus: " + moduleResolved +
+				" stub(s) resolved through a nonzero module base");
+		}
 		return count;
+	}
+
+	/**
+	 * Returns true if the 5 bytes at {@code addr} form a far call to one of the
+	 * discovered overlay dispatchers — i.e. the start of another dispatch stub.
+	 */
+	private static boolean isDispatcherCallf(Memory memory, SegmentedAddressSpace space,
+			MemoryBlock block, Set<Long> dispatchers, Address addr) {
+		try {
+			if (!block.contains(addr) || !block.contains(addr.add(4))) {
+				return false;
+			}
+			if (memory.getByte(addr) != OPCODE_CALLF) {
+				return false;
+			}
+			int off = Short.toUnsignedInt(memory.getShort(addr.add(1)));
+			int seg = Short.toUnsignedInt(memory.getShort(addr.add(3)));
+			return dispatchers.contains(space.getAddress(seg, off).getOffset());
+		}
+		catch (MemoryAccessException | AddressOutOfBoundsException e) {
+			return false;
+		}
 	}
 
 	/**
