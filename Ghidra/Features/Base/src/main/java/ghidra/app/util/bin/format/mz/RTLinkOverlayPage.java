@@ -18,6 +18,8 @@ package ghidra.app.util.bin.format.mz;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
 import ghidra.app.util.bin.BinaryReader;
 
@@ -71,6 +73,28 @@ public class RTLinkOverlayPage {
 
 	public List<RTLinkRelocation> getRelocations() {
 		return relocations;
+	}
+
+	/**
+	 * Returns the module base paragraphs of this page, derived from the distinct
+	 * relocation seg_index values.  RTLink packs multiple link-time modules into one
+	 * overlay page; each module executes with CS = page frame segment + its base
+	 * paragraph, so CS-relative absolute offsets in module code (switch jump tables,
+	 * the module_word of 14-byte dispatch stubs) are module-relative, not
+	 * page-relative.  Module 0 (the page start) is always included.
+	 * <p>
+	 * Note this set is not exhaustive: a module referenced only by dispatch stubs
+	 * (never by an intra-page relocation) does not appear in the relocation table.
+	 *
+	 * @return the sorted set of module base paragraph indices
+	 */
+	public SortedSet<Integer> getModuleBases() {
+		SortedSet<Integer> bases = new TreeSet<>();
+		bases.add(0);
+		for (RTLinkRelocation reloc : relocations) {
+			bases.add(reloc.getSegmentIndex());
+		}
+		return bases;
 	}
 
 	/**
