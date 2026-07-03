@@ -17,7 +17,6 @@ package ghidra.app.plugin.core.analysis;
 
 import ghidra.app.services.*;
 import ghidra.app.util.importer.MessageLog;
-import ghidra.app.util.opinion.MzLoader;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
@@ -43,7 +42,6 @@ public class RTLinkOverlayXrefAnalyzer extends AbstractAnalyzer {
 	private static final String DESCRIPTION =
 		"Creates cross-references for far calls and jumps from overlay code " +
 			"to main program routines.";
-	private static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
 
 	public RTLinkOverlayXrefAnalyzer() {
 		super(NAME, DESCRIPTION, AnalyzerType.INSTRUCTION_ANALYZER);
@@ -53,17 +51,13 @@ public class RTLinkOverlayXrefAnalyzer extends AbstractAnalyzer {
 
 	@Override
 	public boolean canAnalyze(Program program) {
-		if (!MzLoader.MZ_NAME.equals(program.getExecutableFormat())) {
-			return false;
-		}
-		return program.getAddressFactory()
-				.getDefaultAddressSpace() instanceof SegmentedAddressSpace;
+		return RTLinkOverlayAnalyzer.isSegmentedMzProgram(program);
 	}
 
 	@Override
 	public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log)
 			throws CancelledException {
-		if (!program.getOptions(Program.PROGRAM_INFO).getBoolean(ANALYZED_FLAG, false)) {
+		if (!RTLinkOverlayAnalyzer.isOverlayAnalyzed(program)) {
 			return false;
 		}
 
@@ -91,8 +85,8 @@ public class RTLinkOverlayXrefAnalyzer extends AbstractAnalyzer {
 					continue;
 				}
 
-				boolean isFarCall = bytes[0] == (byte) 0x9A;
-				boolean isFarJump = bytes[0] == (byte) 0xEA;
+				boolean isFarCall = bytes[0] == RTLinkOverlayAnalyzer.OPCODE_CALLF;
+				boolean isFarJump = bytes[0] == RTLinkOverlayAnalyzer.OPCODE_JMPF;
 
 				if (!isFarCall && !isFarJump) {
 					continue;
