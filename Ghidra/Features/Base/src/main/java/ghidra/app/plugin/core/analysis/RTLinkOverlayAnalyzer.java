@@ -16,7 +16,6 @@
 package ghidra.app.plugin.core.analysis;
 
 import java.io.IOException;
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -164,11 +163,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				createOverlayBlocks(program, fileBytes, codePages, log, monitor);
 
 			if (applyRelocations && !overlayBlocks.isEmpty()) {
-				int dataSegment = discoverDataSegment(program);
 				monitor.setMessage("RTLink: Applying overlay relocations...");
 				for (OverlayBlockInfo info : overlayBlocks) {
 					monitor.checkCancelled();
-					applyOverlayRelocations(program, info, dataSegment, log);
+					applyOverlayRelocations(program, info, log);
 				}
 			}
 
@@ -198,7 +196,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	@Override
 	public void registerOptions(Options options, Program program) {
 		options.registerOption(OPTION_APPLY_RELOCS, applyRelocations, null,
-			"Patch segment references in overlay code using the data segment value.");
+			"Rebase unrelocated segment words in overlay code by the image base, " +
+				"at the sites given by each page's relocation table.");
 		options.registerOption(OPTION_CREATE_XREFS, createStubXrefs, null,
 			"Discover dispatch stubs and create cross-references to overlay functions.");
 		options.registerOption(OPTION_MARKUP_HEADERS, markupHeaders, null,
@@ -323,59 +322,27 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		return result;
 	}
 
-	private int discoverDataSegment(Program program) {
-		Symbol entry = SymbolUtilities.getLabelOrFunctionSymbol(program, "entry",
-			err -> { /* ignore */ });
-		if (entry == null) {
-			return INITIAL_SEGMENT_VAL;
-		}
-
-		var context = program.getProgramContext();
-		var ds = context.getRegister("ds");
-		if (ds != null) {
-			BigInteger dsValue = context.getValue(ds, entry.getAddress(), false);
-			if (dsValue != null) {
-				return dsValue.intValue();
-			}
-		}
-
-		try {
-			Memory memory = program.getMemory();
-			byte entryByte = memory.getByte(entry.getAddress());
-			if (entryByte == (byte) 0xBA) {
-				short imm = memory.getShort(entry.getAddress().add(1));
-				return Short.toUnsignedInt(imm);
-			}
-		}
-		catch (MemoryAccessException | AddressOutOfBoundsException e) {
-			// fall through
-		}
-
-		return INITIAL_SEGMENT_VAL;
-	}
-
 	private void applyOverlayRelocations(Program program, OverlayBlockInfo info,
-			int dataSegment, MessageLog log) {
+			MessageLog log) {
 		Memory memory = program.getMemory();
 		Address blockStart = info.block().getStart();
 		RTLinkOverlayPage page = info.page();
 		int pageDisplay = page.getPageIndex() - 1;
 
+		// The runtime fixup loop (210d:2e59 in VICEROY.EXE) addresses each patch
+		// site as (frame + seg_index):offset — page-linear seg_index*16 + offset —
+		// and adds the same load delta to the unrelocated segment word found there,
+		// regardless of seg_index. Mirror that with the image base as the delta.
+		int loadDelta = (int) (program.getImageBase().getOffset() >>> 4);
+
 		for (RTLinkRelocation reloc : page.getRelocations()) {
-			int offset = reloc.getOffset();
+			int siteOffset = reloc.getSiteOffset();
 
 			try {
-				Address relocAddr = blockStart.add(offset);
-				int segmentValue;
-
-				if (reloc.getSegmentIndex() == 0) {
-					segmentValue = dataSegment;
-				}
-				else {
-					short currentValue = memory.getShort(relocAddr);
-					segmentValue =
-						(INITIAL_SEGMENT_VAL + Short.toUnsignedInt(currentValue)) & 0xffff;
-				}
+				Address relocAddr = blockStart.add(siteOffset);
+				short currentValue = memory.getShort(relocAddr);
+				int segmentValue =
+					(Short.toUnsignedInt(currentValue) + loadDelta) & 0xffff;
 
 				memory.setShort(relocAddr, (short) segmentValue);
 
@@ -386,7 +353,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			catch (MemoryAccessException | AddressOutOfBoundsException e) {
 				log.appendMsg(String.format(
 					"RTLink: Failed to apply relocation at offset 0x%04X in page %d: %s",
-					offset, pageDisplay, e.getMessage()));
+					siteOffset, pageDisplay, e.getMessage()));
 			}
 		}
 	}
