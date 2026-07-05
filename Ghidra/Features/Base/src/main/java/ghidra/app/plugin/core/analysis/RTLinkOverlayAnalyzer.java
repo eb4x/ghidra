@@ -16,6 +16,7 @@
 package ghidra.app.plugin.core.analysis;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -28,6 +29,8 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.services.*;
 import ghidra.app.util.MemoryBlockUtils;
+import ghidra.app.util.PseudoDisassembler;
+import ghidra.app.util.PseudoInstruction;
 import ghidra.app.util.bin.BinaryReader;
 import ghidra.app.util.bin.FileBytesProvider;
 import ghidra.app.util.bin.format.mz.*;
@@ -38,9 +41,12 @@ import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.DataUtilities;
+import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.reloc.Relocation.Status;
+import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.*;
 import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
@@ -82,6 +88,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * {@link RTLinkOverlayXrefAnalyzer}.
 	 */
 	static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
+	/** PROGRAM_INFO property set once DS (DGROUP) has been assumed, so re-runs don't redo it. */
+	static final String DS_ASSUMED_FLAG = "RTLink Data Segment Assumed";
 
 	private static final int INITIAL_SEGMENT_VAL = 0x1000;
 
@@ -98,10 +106,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private static final String OPTION_APPLY_RELOCS = "Apply Relocations";
 	private static final String OPTION_CREATE_XREFS = "Create Stub Cross-References";
 	private static final String OPTION_MARKUP_HEADERS = "Markup Page Headers";
+	private static final String OPTION_ASSUME_DS = "Assume Data Segment (DS)";
+
+	/** Max instructions to decode when hunting the DGROUP load in the C startup. */
+	private static final int STARTUP_SCAN_LIMIT = 200;
 
 	private boolean applyRelocations = true;
 	private boolean createStubXrefs = true;
 	private boolean markupHeaders = true;
+	private boolean assumeDataSegment = true;
 
 	private long lastTxId = -1;
 
@@ -109,6 +122,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		super(NAME, DESCRIPTION, AnalyzerType.BYTE_ANALYZER);
 		setPriority(AnalysisPriority.FORMAT_ANALYSIS.after());
 		setDefaultEnablement(true);
+		// Offer this analyzer in Analysis -> One Shot so it can be re-run on an
+		// already-analyzed program to retrofit the assumed data segment (DS/DGROUP)
+		// and overlay markup without re-importing.
+		setSupportsOneTimeAnalysis();
 	}
 
 	@Override
@@ -139,6 +156,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		lastTxId = txId;
 
 		if (isOverlayAnalyzed(program)) {
+			// Overlays were processed by a prior run; still retrofit DS on re-analysis so an
+			// already-analyzed program benefits without re-importing.
+			maybeAssumeDataSegment(program, log);
 			return true;
 		}
 
@@ -200,6 +220,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				markupOverlayHeaders(program, fileBytes, allPages, log, monitor);
 			}
 
+			monitor.setMessage("RTLink: Determining data segment (DGROUP)...");
+			maybeAssumeDataSegment(program, log);
+
 			program.getOptions(Program.PROGRAM_INFO).setBoolean(ANALYZED_FLAG, true);
 			return true;
 		}
@@ -222,6 +245,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			"Discover dispatch stubs and create cross-references to overlay functions.");
 		options.registerOption(OPTION_MARKUP_HEADERS, markupHeaders, null,
 			"Create data structures for RTLink page headers in the listing.");
+		options.registerOption(OPTION_ASSUME_DS, assumeDataSegment, null,
+			"Detect DGROUP from the C startup and assume it for DS over all code, so the " +
+				"decompiler resolves DS-relative data accesses (bare offsets like " +
+				"*(int *)0x8542) to real addresses.");
 	}
 
 	@Override
@@ -229,6 +256,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		applyRelocations = options.getBoolean(OPTION_APPLY_RELOCS, applyRelocations);
 		createStubXrefs = options.getBoolean(OPTION_CREATE_XREFS, createStubXrefs);
 		markupHeaders = options.getBoolean(OPTION_MARKUP_HEADERS, markupHeaders);
+		assumeDataSegment = options.getBoolean(OPTION_ASSUME_DS, assumeDataSegment);
 	}
 
 	// ---- Private implementation ----
@@ -242,6 +270,171 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	static boolean isOverlayAnalyzed(Program program) {
 		return program.getOptions(Program.PROGRAM_INFO).getBoolean(ANALYZED_FLAG, false);
+	}
+
+	static boolean isDataSegmentAssumed(Program program) {
+		return program.getOptions(Program.PROGRAM_INFO).getBoolean(DS_ASSUMED_FLAG, false);
+	}
+
+	/** Assume DS once, if the option is on and it hasn't been done for this program yet. */
+	private void maybeAssumeDataSegment(Program program, MessageLog log) {
+		if (assumeDataSegment && !isDataSegmentAssumed(program)) {
+			assumeDataSegmentRegister(program, log);
+		}
+	}
+
+	/**
+	 * Establish the data segment (DGROUP) so the decompiler can resolve DS-relative data
+	 * accesses. In the small-data DOS model DS == SS == DGROUP, loaded once in the C startup
+	 * (e.g. {@code MOV DI,DGROUP; MOV SS,DI; PUSH SS; POP DS}). We follow the entry's initial
+	 * far jump into the startup, linearly decode it while tracking register immediates, and
+	 * take the value moved into SS/DS as DGROUP. That value is then assumed for DS over all
+	 * executable memory; without it every DS-relative global collapses to a bare offset in an
+	 * unmapped space (e.g. {@code *(int *)0x8542}) that ignores applied data types.
+	 */
+	private void assumeDataSegmentRegister(Program program, MessageLog log) {
+		Register ds = program.getLanguage().getRegister("DS");
+		if (ds == null) {
+			return;
+		}
+		Address entry = firstEntryPoint(program);
+		if (entry == null) {
+			return;
+		}
+		Integer dgroup = detectDataSegment(program, entry);
+		if (dgroup == null) {
+			log.appendMsg("RTLink: could not determine DGROUP from startup; DS left unset");
+			return;
+		}
+		ProgramContext context = program.getProgramContext();
+		BigInteger value = BigInteger.valueOf(dgroup & 0xffffL);
+		int blocks = 0;
+		try {
+			for (MemoryBlock block : program.getMemory().getBlocks()) {
+				if (block.isExecute()) {
+					context.setValue(ds, block.getStart(), block.getEnd(), value);
+					blocks++;
+				}
+			}
+		}
+		catch (ContextChangeException e) {
+			log.appendMsg("RTLink: failed to assume DS: " + e.getMessage());
+			return;
+		}
+		program.getOptions(Program.PROGRAM_INFO).setBoolean(DS_ASSUMED_FLAG, true);
+		Msg.info(this, String.format(
+			"RTLink: Assuming DS = 0x%04X (DGROUP) over %d executable blocks", dgroup, blocks));
+		log.appendMsg(String.format("RTLink: Assuming DS = 0x%04X (DGROUP)", dgroup));
+	}
+
+	private static Address firstEntryPoint(Program program) {
+		AddressIterator it = program.getSymbolTable().getExternalEntryPointIterator();
+		return it.hasNext() ? it.next() : null;
+	}
+
+	/**
+	 * Follow the entry's initial unconditional (far) jump into the C startup, then linearly
+	 * decode instructions tracking each general register's last immediate. Returns the segment
+	 * value moved into SS or DS (DGROUP), or null if not found within {@link #STARTUP_SCAN_LIMIT}
+	 * instructions. Decoding is done with a {@link PseudoDisassembler} so it works before the
+	 * program is disassembled and commits nothing.
+	 */
+	private static Integer detectDataSegment(Program program, Address entry) {
+		Register ss = program.getLanguage().getRegister("SS");
+		Register ds = program.getLanguage().getRegister("DS");
+		PseudoDisassembler disassembler = new PseudoDisassembler(program);
+
+		// Follow the entry's first unconditional jump (entry -> ... -> startup).
+		Address addr = entry;
+		for (int i = 0; i < 8 && addr != null; i++) {
+			PseudoInstruction instr = safeDecode(disassembler, addr);
+			if (instr == null) {
+				break;
+			}
+			FlowType flow = instr.getFlowType();
+			if (flow.isJump() && !flow.isConditional()) {
+				Address[] flows = instr.getFlows();
+				if (flows != null && flows.length == 1) {
+					addr = flows[0];
+					break;
+				}
+			}
+			addr = nextLinear(instr);
+		}
+		if (addr == null) {
+			addr = entry;
+		}
+
+		// Linearly decode the startup, watching for the SS/DS segment load.
+		Map<Register, Long> regImm = new HashMap<>();
+		for (int i = 0; i < STARTUP_SCAN_LIMIT; i++) {
+			PseudoInstruction instr = safeDecode(disassembler, addr);
+			if (instr == null) {
+				return null;
+			}
+			if ("MOV".equals(instr.getMnemonicString())) {
+				Register dest = instr.getRegister(0);
+				if (dest != null && (dest.equals(ss) || dest.equals(ds))) {
+					Register src = instr.getRegister(1);
+					Long imm = src != null ? regImm.get(src) : null;
+					if (imm != null) {
+						return (int) (imm.longValue() & 0xffffL);
+					}
+				}
+				else if (dest != null) {
+					int type = instr.getOperandType(1);
+					Register src = instr.getRegister(1);
+					Scalar scalar = instr.getScalar(1);
+					if (scalar != null && OperandType.isScalar(type) &&
+						!OperandType.isAddress(type)) {
+						// A true immediate (not a memory displacement like [0x2]).
+						regImm.put(dest, scalar.getUnsignedValue());
+					}
+					else if (src != null && regImm.containsKey(src)) {
+						regImm.put(dest, regImm.get(src));
+					}
+					else {
+						regImm.remove(dest);
+					}
+				}
+			}
+			else {
+				// Any other write to a tracked register invalidates its known immediate.
+				for (Object result : instr.getResultObjects()) {
+					if (result instanceof Register reg) {
+						regImm.remove(reg);
+					}
+				}
+			}
+			addr = nextLinear(instr);
+			if (addr == null) {
+				return null;
+			}
+		}
+		return null;
+	}
+
+	private static PseudoInstruction safeDecode(PseudoDisassembler disassembler, Address addr) {
+		try {
+			return disassembler.disassemble(addr);
+		}
+		catch (Exception e) {
+			return null;
+		}
+	}
+
+	/** The next physical instruction address (fall-through preferred), or null past the block. */
+	private static Address nextLinear(PseudoInstruction instr) {
+		Address fallThrough = instr.getFallThrough();
+		if (fallThrough != null) {
+			return fallThrough;
+		}
+		try {
+			return instr.getAddress().add(instr.getLength());
+		}
+		catch (AddressOutOfBoundsException e) {
+			return null;
+		}
 	}
 
 	private static long computeImageEnd(OldDOSHeader header) {
