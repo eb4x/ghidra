@@ -19,6 +19,8 @@ import java.util.*;
 
 import generic.hash.SimpleCRC32;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.listing.Instruction;
 
 /**
@@ -104,9 +106,10 @@ public class DynamicHash {
 		public int hash(int reg) {
 			reg = SimpleCRC32.hashOneByte(reg, slot);
 			reg = SimpleCRC32.hashOneByte(reg, transtable[op.getOpcode()]);
-			long val = op.getSeqnum().getTarget().getOffset();
-			int sz = op.getSeqnum().getTarget().getSize();
-			for (int i = 0; i < sz; i += 8) {
+			Address target = op.getSeqnum().getTarget();
+			long val = target.getOffset();
+			int sz = getAddressByteSize(target.getAddressSpace());
+			for (int i = 0; i < sz; ++i) {
 				reg = SimpleCRC32.hashOneByte(reg, (int) val);
 				val >>= 8;
 			}
@@ -652,6 +655,28 @@ public class DynamicHash {
 			markop.add(op);
 			markset.add(op);
 		}
+	}
+
+	/**
+	 * Get the number of address bytes to hash for ops at addresses in the given space.
+	 * This must produce the same count as the C++ AddrSpace::getAddrSize() for the space
+	 * description that SleighLanguage.encodeTranslator() sends to the decompiler process,
+	 * or hashes computed here will not match hashes computed by the decompiler.  In
+	 * particular a (16-bit x86) segmented space reports a bit size of 21, but is presented
+	 * to the decompiler as a 4-byte space.
+	 * @param space is the given address space
+	 * @return the number of bytes of an offset in the space that get hashed
+	 */
+	private static int getAddressByteSize(AddressSpace space) {
+		AddressSpace physical = space.getPhysicalSpace();	// Overlays hash like their underlying space
+		int size = physical.getSize();
+		if (physical instanceof SegmentedAddressSpace) {
+			size = 32;		// Decompiler sees a segmented space as 4 bytes
+		}
+		if (size > 64) {
+			size = 64;
+		}
+		return (size + 7) / 8;
 	}
 
 	public static Varnode findVarnode(PcodeSyntaxTree fd, Address addr, long h) {
