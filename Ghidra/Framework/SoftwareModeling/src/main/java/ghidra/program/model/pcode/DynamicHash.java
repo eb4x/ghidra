@@ -104,8 +104,10 @@ public class DynamicHash {
 		public int hash(int reg) {
 			reg = SimpleCRC32.hashOneByte(reg, slot);
 			reg = SimpleCRC32.hashOneByte(reg, transtable[op.getOpcode()]);
-			long val = op.getSeqnum().getTarget().getOffset();
-			int sz = op.getSeqnum().getTarget().getPointerSize();
+			Address target = op.getSeqnum().getTarget();
+			long val = target.getOffset();
+			// The decompiler gives an overlay the address size of its base space
+			int sz = target.getAddressSpace().getPhysicalSpace().getPointerSize();
 			for (int i = 0; i < sz; i += 1) {
 				reg = SimpleCRC32.hashOneByte(reg, (int) val);
 				val >>= 8;
