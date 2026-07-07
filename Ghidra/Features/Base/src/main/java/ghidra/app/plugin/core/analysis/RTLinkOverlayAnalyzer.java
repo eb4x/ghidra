@@ -75,6 +75,14 @@ import ghidra.util.task.TaskMonitor;
  * offset); 14-byte stubs carry the target module's base paragraph in module_word,
  * and the in-page code offset is {@code JMPF offset + module_word * 16}. See
  * {@link #scanForJmpfStubs} for how the two forms are told apart.
+ * <p>
+ * The same jump table also holds 10-byte <em>resident-target trampolines</em>:
+ * {@code CALLF seg:disp} + {@code JMPF seg:off} with a real (relocated) target
+ * segment. RTLink routes far calls from movable overlay code into resident code
+ * through these so the overlay manager can re-vector the caller's far return
+ * address if its page moves. Each one is converted into a thunk of its JMPF
+ * target; see {@link #scanForResidentTrampolines} for why leaving them as plain
+ * functions damages decompilation at every call site.
  */
 public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
@@ -96,6 +104,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	static final byte OPCODE_CALLF = (byte) 0x9A;
 	static final byte OPCODE_JMPF = (byte) 0xEA;
 	private static final int PAGE_ID_MASK = 0x3FFF;
+
+	// Far calling convention (x86-16.cspec: extrapop=4, stackshift=4) stamped on every
+	// stub/trampoline target so thunk call sites model the far return address and decode
+	// their arguments at the correct stack offsets.
+	private static final String FAR_CALLING_CONVENTION = "__cdecl16far";
 
 	// A real overlay dispatcher is the CALLF target shared by many stubs. Any
 	// physical address hit by at least this many CALLF+JMPF stub candidates is
@@ -156,8 +169,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		lastTxId = txId;
 
 		if (isOverlayAnalyzed(program)) {
-			// Overlays were processed by a prior run; still retrofit DS on re-analysis so an
-			// already-analyzed program benefits without re-importing.
+			// Overlays were processed by a prior run; still retrofit what can be repaired
+			// in place on re-analysis so an already-analyzed program benefits without
+			// re-importing: re-wire dispatch-stub thunks (clearing stale no-return flags
+			// that silently truncate every caller's decompilation) and assume DS.
+			if (createStubXrefs) {
+				repairStubThunks(program, log, monitor);
+			}
 			maybeAssumeDataSegment(program, log);
 			return true;
 		}
@@ -242,7 +260,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			"Rebase unrelocated segment words in overlay code by the image base, " +
 				"at the sites given by each page's relocation table.");
 		options.registerOption(OPTION_CREATE_XREFS, createStubXrefs, null,
-			"Discover dispatch stubs and create cross-references to overlay functions.");
+			"Discover dispatch stubs and resident-target trampolines; create " +
+				"cross-references and thunks to their targets.");
 		options.registerOption(OPTION_MARKUP_HEADERS, markupHeaders, null,
 			"Create data structures for RTLink page headers in the listing.");
 		options.registerOption(OPTION_ASSUME_DS, assumeDataSegment, null,
@@ -606,27 +625,54 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				pendingThunks, log, monitor);
 		}
 
+		// Resident-target trampolines share the jump table with the CALLF+JMPF
+		// dispatch stubs, so only look for them once segment-0 stubs have
+		// corroborated that this binary uses that scheme (an INT 3Fh-era binary has
+		// no smart-vectoring helper, and a shared CALLF+JMPF pair count alone is a
+		// weaker signal when the JMPF segment is a plausible real value).
+		AddressSet trampolineTargets = new AddressSet();
+		List<StubTarget> pendingTrampolines = new ArrayList<>();
+		int trampolines = 0;
+		if (jmpfStubs > 0) {
+			trampolines = scanForResidentTrampolines(program, dispatchers,
+				trampolineTargets, pendingTrampolines, monitor);
+		}
+
 		int total = jmpfStubs + int3fStubs;
-		if (total == 0) {
+		if (total == 0 && trampolines == 0) {
 			log.appendMsg("RTLink: No dispatch stubs found");
 			return;
 		}
 
-		// Disassemble the overlay code reachable from the resolved entry points and
-		// promote each entry point to a function with a real body. Without this the
-		// overlay pages hold no instructions, so intra-overlay calls and jumps never
-		// get references and every overlay "function" is a one-byte husk.
-		disassembleOverlayCode(program, overlayBlocks, overlayEntryPoints, log, monitor);
-
-		// Now that the overlay targets are real functions, wire each dispatch stub to
-		// its target as a thunk.
 		FunctionManager funcMgr = program.getFunctionManager();
-		for (StubTarget stub : pendingThunks) {
-			monitor.checkCancelled();
-			createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(), log);
+
+		if (total > 0) {
+			// Disassemble the overlay code reachable from the resolved entry points and
+			// promote each entry point to a function with a real body. Without this the
+			// overlay pages hold no instructions, so intra-overlay calls and jumps never
+			// get references and every overlay "function" is a one-byte husk.
+			disassembleOverlayCode(program, overlayBlocks, overlayEntryPoints, log, monitor);
+
+			// Now that the overlay targets are real functions, wire each dispatch stub to
+			// its target as a thunk.
+			for (StubTarget stub : pendingThunks) {
+				monitor.checkCancelled();
+				createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(),
+					log);
+			}
 		}
 
-		Msg.info(this, "RTLink/Plus: Resolved " + total + " dispatch stubs");
+		if (trampolines > 0) {
+			disassembleResidentTargets(program, trampolineTargets, log, monitor);
+			for (StubTarget stub : pendingTrampolines) {
+				monitor.checkCancelled();
+				createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(),
+					log);
+			}
+		}
+
+		Msg.info(this, "RTLink/Plus: Resolved " + total + " dispatch stub(s) and " +
+			trampolines + " resident-target trampoline(s)");
 	}
 
 	/**
@@ -920,6 +966,148 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
+	 * Scan for resident-target trampolines in the RTLink jump table.
+	 * <p>
+	 * Trampoline layout (10 bytes):
+	 * <pre>
+	 *   [0-4]   9A oo oo ss ss   CALLF seg:disp   (seg:disp resolves to a dispatcher)
+	 *   [5-9]   EA oo oo ss ss   JMPF seg:off     (relocated resident target)
+	 * </pre>
+	 * RTLink routes far calls from (movable) overlay code into resident code through
+	 * these shims: the dispatcher entry re-vectors the caller's far return address in
+	 * case its overlay page moves, then the JMPF tail-jumps to the real function —
+	 * semantically a plain far call. Trampolines are told apart from overlay dispatch
+	 * stubs by the JMPF segment: dispatch stubs carry the unrelocated {@code 0000},
+	 * trampolines a real segment that lands in resident executable memory.
+	 * <p>
+	 * Each trampoline is queued for conversion into a thunk of its JMPF target. Left
+	 * as plain functions they degrade decompilation at every call site: having no RET
+	 * of their own, convention analysis leaves them on the default (near) convention,
+	 * parameters are modeled one stack slot too low, and every caller decompiles with
+	 * a junk leading argument that swallows a real one. A thunk delegates name,
+	 * signature and (far) calling convention to the target.
+	 */
+	private int scanForResidentTrampolines(Program program, Set<Long> dispatchers,
+			AddressSet trampolineTargets, List<StubTarget> pendingThunks,
+			TaskMonitor monitor) throws CancelledException {
+		if (dispatchers.isEmpty()) {
+			return 0;
+		}
+
+		Memory memory = program.getMemory();
+		SegmentedAddressSpace space =
+			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+		int count = 0;
+
+		for (MemoryBlock block : memory.getBlocks()) {
+			if (block.isOverlay() || !block.isExecute() || !block.isInitialized()) {
+				continue;
+			}
+
+			Address searchAddr = block.getStart();
+			Address blockEnd = block.getEnd();
+
+			while (searchAddr != null && searchAddr.compareTo(blockEnd) < 0) {
+				monitor.checkCancelled();
+
+				searchAddr = memory.findBytes(searchAddr, blockEnd,
+					new byte[] { OPCODE_JMPF }, null, true, monitor);
+				if (searchAddr == null) {
+					break;
+				}
+
+				try {
+					Address callfAddr = searchAddr.subtract(5);
+					if (!block.contains(callfAddr) || !block.contains(searchAddr.add(4))) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					int targetSegment =
+						Short.toUnsignedInt(memory.getShort(searchAddr.add(3)));
+					if (targetSegment == 0x0000) {
+						// Unrelocated segment: an overlay dispatch stub, not a
+						// trampoline (handled by scanForJmpfStubs).
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					if (!isDispatcherCallf(memory, space, block, dispatchers, callfAddr)) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					int targetOffset =
+						Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
+					Address targetAddr = space.getAddress(targetSegment, targetOffset);
+
+					MemoryBlock targetBlock = memory.getBlock(targetAddr);
+					if (targetBlock == null || targetBlock.isOverlay() ||
+						!targetBlock.isExecute() || !targetBlock.isInitialized()) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					// A jump back into the trampoline's own bytes is not a trampoline.
+					long delta = targetAddr.getOffset() - callfAddr.getOffset();
+					if (delta >= 0 && delta < 10) {
+						searchAddr = searchAddr.add(1);
+						continue;
+					}
+
+					trampolineTargets.add(targetAddr);
+					pendingThunks.add(new StubTarget(callfAddr, targetAddr, 10));
+					count++;
+				}
+				catch (MemoryAccessException | AddressOutOfBoundsException e) {
+					// skip
+				}
+
+				searchAddr = searchAddr.add(1);
+			}
+		}
+
+		if (count > 0) {
+			Msg.debug(this,
+				"RTLink/Plus: Found " + count + " resident-target trampoline(s)");
+		}
+		return count;
+	}
+
+	/**
+	 * Disassemble the resident trampoline targets and promote each to a function, so
+	 * {@link #createThunkAtStub} has real functions to thunk to. Many targets are
+	 * reachable only through the trampolines (far calls from overlay code), so regular
+	 * flow analysis alone may never get there. Targets that land inside an existing
+	 * function's body are left alone here and skipped by the thunk pass.
+	 */
+	private void disassembleResidentTargets(Program program, AddressSet targets,
+			MessageLog log, TaskMonitor monitor) throws CancelledException {
+		if (targets.isEmpty()) {
+			return;
+		}
+
+		AddressSet residentRange = new AddressSet();
+		for (MemoryBlock block : program.getMemory().getBlocks()) {
+			if (!block.isOverlay() && block.isExecute() && block.isInitialized()) {
+				residentRange.add(block.getStart(), block.getEnd());
+			}
+		}
+
+		monitor.setMessage("RTLink: Disassembling trampoline targets...");
+		DisassembleCommand disCmd = new DisassembleCommand(targets, residentRange, true);
+		if (!disCmd.applyTo(program, monitor)) {
+			log.appendMsg(
+				"RTLink: Trampoline target disassembly reported: " + disCmd.getStatusMsg());
+		}
+		monitor.checkCancelled();
+
+		monitor.setMessage("RTLink: Creating trampoline target functions...");
+		CreateFunctionCmd funcCmd = new CreateFunctionCmd(targets, SourceType.ANALYSIS);
+		funcCmd.applyTo(program, monitor);
+	}
+
+	/**
 	 * Scan for INT 3Fh (CD 3F) stubs used by older RTLink versions.
 	 * Pattern: CD 3F xx xx yy yy (INT 3Fh, overlay_id, offset)
 	 */
@@ -1004,8 +1192,35 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					new AddressSet(targetAddr, targetAddr), SourceType.ANALYSIS);
 			}
 			catch (Exception e) {
+				// The stub's overlay target is not (yet) a function and cannot be made
+				// one — e.g. the address holds defined data, or overlay disassembly has
+				// not reached it. Without a target there is nothing to thunk to, so the
+				// stub is left as-is. This used to return silently, hiding exactly the
+				// "stub never became a thunk, nothing logged" failures this pass exists
+				// to surface — so say so.
+				log.appendMsg(String.format(
+					"RTLink: could not create overlay target function at %s for stub %s: %s",
+					targetAddr, stubAddr, e.getMessage()));
 				return;
 			}
+		}
+
+		// A thunk delegates its signature to its target, so a far call site only decodes
+		// correctly when the target carries a far convention. Stamp it before wiring.
+		stampFarConvention(overlayFunc, log);
+
+		// A no-return flag on the overlay target truncates the decompilation of every
+		// caller of every stub that forwards to it: stub thunks delegate hasNoReturn()
+		// to their target. Ghidra's no-return discovery mis-fires on dispatch stubs
+		// while overlay flow is still unresolved (the stub's JMPF 0000:offset decodes
+		// as a jump into unmapped memory), and setNoReturn(true) on the stub thunk
+		// lands on the overlay target. If the target's disassembled body demonstrably
+		// returns, the flag is stale — clear it.
+		if (overlayFunc.hasNoReturn() && bodyReturns(overlayFunc)) {
+			log.appendMsg(String.format(
+				"RTLink: clearing stale no-return flag on %s at %s (body returns)",
+				overlayFunc.getName(), targetAddr));
+			overlayFunc.setNoReturn(false);
 		}
 
 		Function existingStub = funcMgr.getFunctionAt(stubAddr);
@@ -1016,6 +1231,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				return;
 			}
 			try {
+				// Clear any no-return flag discovered while the stub was still a
+				// plain function before converting it: a dispatch stub returns iff
+				// its overlay target returns.
+				existingStub.setNoReturn(false);
 				existingStub.setThunkedFunction(overlayFunc);
 				return;
 			}
@@ -1040,6 +1259,110 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			log.appendMsg(String.format(
 				"RTLink: could not create stub thunk at %s -> %s: %s",
 				stubAddr, targetAddr, e.getMessage()));
+		}
+	}
+
+	/**
+	 * Returns true if {@code func}'s disassembled body contains a return instruction —
+	 * proof that a no-return flag on it is wrong.
+	 */
+	private static boolean bodyReturns(Function func) {
+		InstructionIterator it =
+			func.getProgram().getListing().getInstructions(func.getBody(), true);
+		while (it.hasNext()) {
+			if (it.next().getFlowType() == RefType.TERMINATOR) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Stamp {@code __cdecl16far} on a stub/trampoline target whose signature Ghidra has
+	 * not yet pinned down. A thunk delegates its signature to its target, so a far call
+	 * site only decodes correctly when the target carries a far convention; left on the
+	 * x86-16 default (near) convention the target models its parameters one stack slot
+	 * too low and every caller decompiles with a junk leading argument that swallows a
+	 * real one. Every function reached through a jump-table dispatch stub or a resident
+	 * trampoline is far-called by construction, so this is safe for exactly that set.
+	 * User-provided signatures are never touched, and the default/unknown-convention
+	 * guard makes re-runs idempotent (a second pass sees the convention already set).
+	 */
+	private static void stampFarConvention(Function overlayFunc, MessageLog log) {
+		SourceType sigSource = overlayFunc.getSignatureSource();
+		if (sigSource != SourceType.DEFAULT && sigSource != SourceType.ANALYSIS) {
+			return;
+		}
+		String convention = overlayFunc.getCallingConventionName();
+		boolean conventionUnset = overlayFunc.getCallingConvention() == null ||
+			Function.DEFAULT_CALLING_CONVENTION_STRING.equals(convention) ||
+			Function.UNKNOWN_CALLING_CONVENTION_STRING.equals(convention);
+		if (!conventionUnset) {
+			return;
+		}
+		try {
+			overlayFunc.setCallingConvention(FAR_CALLING_CONVENTION);
+		}
+		catch (InvalidInputException e) {
+			log.appendMsg(String.format("RTLink: could not set %s on %s at %s: %s",
+				FAR_CALLING_CONVENTION, overlayFunc.getName(), overlayFunc.getEntryPoint(),
+				e.getMessage()));
+		}
+	}
+
+	/**
+	 * Re-run dispatch-stub discovery and thunk wiring — including resident-target
+	 * trampolines — on a program whose overlays were created by a prior (possibly
+	 * older) run of this analyzer, without re-importing.
+	 * <p>
+	 * Everything this does is idempotent: existing labels, references and functions are
+	 * kept (a plain function converted to a thunk keeps its user-defined name), correct
+	 * thunks are left untouched, and {@link #createThunkAtStub} repairs stubs that
+	 * ended up as plain functions as well as overlay targets carrying a stale
+	 * no-return flag (which silently truncates the decompilation of every caller of
+	 * every stub forwarding to them).
+	 */
+	private void repairStubThunks(Program program, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		List<FileBytes> allFileBytes = program.getMemory().getAllFileBytes();
+		if (allFileBytes.isEmpty()) {
+			return;
+		}
+		FileBytes fileBytes = allFileBytes.get(0);
+		try (FileBytesProvider provider = new FileBytesProvider(fileBytes)) {
+			BinaryReader reader = new BinaryReader(provider, true);
+			OldDOSHeader header = new OldDOSHeader(reader);
+			long overlayStart = (computeImageEnd(header) + 15) & ~15L;
+			List<RTLinkOverlayPage> allPages =
+				RTLinkOverlayPage.parseAllPages(reader, overlayStart, fileBytes.getSize());
+			if (allPages.size() < 2) {
+				return;
+			}
+
+			// Rebuild the OverlayBlockInfo list from the existing blocks, mirroring
+			// createOverlayBlocks()'s skip logic so stub page indexing lines up.
+			Memory memory = program.getMemory();
+			List<OverlayBlockInfo> overlayBlocks = new ArrayList<>();
+			for (RTLinkOverlayPage page : allPages.subList(1, allPages.size())) {
+				if (page.getCodeSize() <= 0) {
+					continue;
+				}
+				MemoryBlock block = memory
+						.getBlock(String.format("OVERLAY_%02d", page.getPageIndex() - 1));
+				if (block == null) {
+					// Unexpected layout (blocks renamed/removed); leave the program alone.
+					return;
+				}
+				overlayBlocks.add(new OverlayBlockInfo(page, block));
+			}
+
+			discoverAndProcessStubs(program, overlayBlocks, log, monitor);
+		}
+		catch (CancelledException e) {
+			throw e;
+		}
+		catch (Exception e) {
+			log.appendMsg("RTLink: stub thunk retrofit failed: " + e.getMessage());
 		}
 	}
 
