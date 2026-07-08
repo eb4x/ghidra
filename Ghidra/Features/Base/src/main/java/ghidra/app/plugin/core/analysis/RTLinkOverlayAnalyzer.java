@@ -93,7 +93,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			"creates cross-references from dispatch stubs to overlay functions.";
 	/**
 	 * PROGRAM_INFO property set when overlay analysis completes; gates
-	 * {@link RTLinkOverlayXrefAnalyzer}.
+	 * {@link RTLinkXrefAnalyzer}'s far call/jump pass.
 	 */
 	static final String ANALYZED_FLAG = "RTLink Overlay Analyzed";
 	/** PROGRAM_INFO property set once DS (DGROUP) has been assumed, so re-runs don't redo it. */
