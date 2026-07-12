@@ -34,18 +34,28 @@ import ghidra.util.exception.DuplicateNameException;
  *     uint16 reloc_count;          // entries in the first relocation list
  *     uint16 reloc_count_2;        // entries in the second list, if any
  *     uint16 reloc_count_3;        // entries in the third list, if any
- *     uint16 reserved;             // always 0
+ *     uint16 codeview_word;        // 0 unless the program was linked with CODEVIEW
  * };
  * </pre>
  * <p>
- * Every field here is a word. Reading {@code frame_size} or {@code reloc_count} as a
- * 32-bit value happens to work on VICEROY.EXE, where the word following each is always
- * zero — an overfit to the one binary this analyzer was first written against, and one
- * that has already cost us twice. NEBULAR.EXE (Rex Nebular) carries a second relocation
- * list on 15 of its 79 pages; read as a dword, page 1's {@code reloc_count} of 94 becomes
- * 131166, {@link #isValid()} rejects it, and the page walk stops before it starts — which
- * is why that binary once imported with no overlay blocks at all. ROE2MAIN.EXE failed
- * more quietly still: 27 of its 171 pages parsed and the rest were dropped.
+ * Every field here is a word, and <b>none of them may be assumed zero</b>. Three separate
+ * bugs in this class came from treating a field that VICEROY.EXE happens to zero as if the
+ * format guaranteed it:
+ * <ol>
+ * <li>{@code reloc_count} read as a dword swallows {@code reloc_count_2}. NEBULAR.EXE
+ *     (Rex Nebular) carries a second list on 15 of its 79 pages; page 1's count of 94
+ *     became 131166, {@link #isValid()} rejected it, and the page walk stopped before it
+ *     started — the binary imported with no overlay blocks at all. SPHERE.EXE
+ *     (Dragonsphere) failed identically. ROE2MAIN.EXE failed more quietly: 27 of its 171
+ *     pages parsed and the rest were silently dropped.</li>
+ * <li>{@code frame_size} read as a dword swallows {@code reloc_start_index}.</li>
+ * <li>The last word was declared {@code reserved} and <i>validated as zero</i>. It is not
+ *     reserved. Pocket Soft's own VMEX2.EXE example — the same program as VMEX1.EXE, built
+ *     with one extra linker directive, {@code CODEVIEW} — carries 0x091C there on every one
+ *     of its five pages, and the zero check rejected the whole executable.</li>
+ * </ol>
+ * The moral, learned three times: check a constant against a second executable before
+ * believing it is part of the format.
  * <p>
  * The layout above is confirmed against the RTLink runtime's own relocation code (traced
  * in VICEROY at 210d:2318, which drives the fixup subroutine at 210d:2e59). That routine
@@ -77,7 +87,7 @@ public class RTLinkPageHeader implements StructConverter {
 	private int relocCount;
 	private int secondRelocCount;
 	private int thirdRelocCount;
-	private int reserved;
+	private int codeviewWord;
 
 	/**
 	 * Constructs a new RTLink/Plus page header
@@ -93,7 +103,7 @@ public class RTLinkPageHeader implements StructConverter {
 		relocCount = Short.toUnsignedInt(reader.readNextShort());
 		secondRelocCount = Short.toUnsignedInt(reader.readNextShort());
 		thirdRelocCount = Short.toUnsignedInt(reader.readNextShort());
-		reserved = Short.toUnsignedInt(reader.readNextShort());
+		codeviewWord = Short.toUnsignedInt(reader.readNextShort());
 	}
 
 	public int getTotalParagraphs() {
@@ -154,8 +164,15 @@ public class RTLinkPageHeader implements StructConverter {
 		return (entryIndex + 3) & ~3;
 	}
 
-	public int getReserved() {
-		return reserved;
+	/**
+	 * The last word of the header. Zero unless the program was linked with the
+	 * {@code CODEVIEW} directive, in which case the linker stamps the same nonzero value
+	 * into every page (0x091C throughout Pocket Soft's VMEX2.EXE). Its meaning is unknown;
+	 * what matters here is that it is <b>not</b> reserved, so {@link #isValid()} must not
+	 * require it to be zero — doing so rejected VMEX2.EXE outright.
+	 */
+	public int getCodeviewWord() {
+		return codeviewWord;
 	}
 
 	public int getTotalSizeBytes() {
@@ -185,9 +202,11 @@ public class RTLinkPageHeader implements StructConverter {
 		if (frameSize <= 0) {
 			return false;
 		}
-		if (reserved != 0) {
-			return false;
-		}
+		// Deliberately no check on codeviewWord: it is not reserved, and requiring it to be
+		// zero rejected every page of a CODEVIEW-linked program (see the class comment).
+		// The remaining checks plus the page-chain walk in RTLinkOverlayPage.parseAllPages
+		// carry the validation; nothing in the corpus is newly accepted without this one.
+		//
 		// All three relocation lists live in the overhead area, ahead of the code. The
 		// lists run in order, so the end of the last one bounds them all.
 		long overheadBytes = (long) overheadParagraphs * 16;
@@ -205,7 +224,7 @@ public class RTLinkPageHeader implements StructConverter {
 		struct.add(WORD, "reloc_count", "Entries in the first relocation list");
 		struct.add(WORD, "reloc_count_2", "Entries in the second relocation list (0 if none)");
 		struct.add(WORD, "reloc_count_3", "Entries in the third relocation list (0 if none)");
-		struct.add(WORD, "reserved", "Reserved (always 0)");
+		struct.add(WORD, "codeview_word", "Nonzero only in CODEVIEW-linked programs");
 		struct.setCategoryPath(new CategoryPath("/DOS/RTLink"));
 		return struct;
 	}
