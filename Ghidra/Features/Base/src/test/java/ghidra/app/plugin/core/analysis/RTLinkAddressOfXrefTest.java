@@ -48,7 +48,7 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 	public void testAddressOfImmediateXrefs() throws Exception {
 		ProgramBuilder builder = new ProgramBuilder("AOF", ProgramBuilder._X86_16_REAL_MODE);
 		try {
-			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0000", 0x20);
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0000", 0x40);
 			// mirrors CODE_104: the executable low-DGROUP region — targets here rejected
 			MemoryBlock dgLow = builder.createMemory("CODE_DG", "0x2000:0x0000", 0x100);
 			builder.withTransaction(() -> {
@@ -57,6 +57,10 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 			});
 			// mirrors the BSS DATA block: uninitialized rw- — valid target
 			builder.createUninitializedMemory("DATA", "0x2000:0x1000", 0x100);
+			// mapped rw- block covering the VGA segment and 0x8000 sentinel values,
+			// so the value exclusions (not the block guard) are what those cases
+			// exercise
+			builder.createUninitializedMemory("DATA_HI", "0x2000:0x8000", 0x2010);
 
 			builder.setBytes("0x1000:0x0000",
 			// @formatter:off
@@ -69,10 +73,14 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 				"05 10 10 " +    // 0x0012  ADD AX,0x1010   -> &g[i] idiom, AX allowed: DATA ref
 				"81 c1 30 10 " + // 0x0015  ADD CX,0x1030   -> CX allowed for ADD: DATA ref
 				"81 c5 10 10 " + // 0x0019  ADD BP,0x1010   -> BP excluded: no ref
-				"a1 10 10",      // 0x001d  MOV AX,[0x1010] -> deref pass: READ ref
+				"a1 10 10 " +    // 0x001d  MOV AX,[0x1010] -> deref pass: READ ref
+				"68 00 a0 " +    // 0x0020  PUSH 0xA000     -> video segment, mapped target: no ref
+				"bf 40 10 " +    // 0x0023  MOV DI,0x1040   -> flows into ES below: no ref
+				"8e c7 " +       // 0x0026  MOV ES,DI       -> the segment load
+				"68 00 80",      // 0x0028  PUSH 0x8000     -> sentinel constant, mapped target: no ref
 			// @formatter:on
 				true);
-			builder.setRegisterValue("DS", "0x1000:0x0000", "0x1000:0x001f", 0x2000);
+			builder.setRegisterValue("DS", "0x1000:0x0000", "0x1000:0x003f", 0x2000);
 
 			Program program = builder.getProgram();
 			ProgramContext context = program.getProgramContext();
@@ -133,6 +141,13 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 			assertTrue("deref pass must still make READ refs",
 				deref[0].getReferenceType().isRead());
 			assertEquals(builder.addr("0x2000:0x1010"), deref[0].getToAddress());
+
+			assertEquals("PUSH of a video segment value must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0020")).length);
+			assertEquals("immediate that flows into ES must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0023")).length);
+			assertEquals("PUSH of the 0x8000 sentinel must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0028")).length);
 		}
 		finally {
 			builder.dispose();

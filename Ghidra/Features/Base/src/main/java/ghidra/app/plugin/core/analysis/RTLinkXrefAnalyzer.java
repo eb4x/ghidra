@@ -52,11 +52,17 @@ import ghidra.util.task.TaskMonitor;
  * {@code PUSH 0x540e}) otherwise show zero xrefs, and for array-typed globals the
  * dominant referent shape is the indexing idiom &mdash; {@code &g_players[i]}
  * compiles to a scaled index plus {@code ADD reg,0x540e} (27 of g_players' 29 real
- * referents).  The block guard is the false-positive bound: every small
- * coincidental constant falls below the data block's start offset.  Stock
- * analysis never makes these &mdash; {@code ConstantPropagationAnalyzer} disables
- * param-constant refs on segmented address spaces and resolves bare constants as
- * segment-0 addresses.</li>
+ * referents).  The block guard rejects every small coincidental constant (they
+ * fall below the data block's start offset), but it cannot tell a <i>segment</i>
+ * constant from an offset &mdash; real-mode segment values like {@code A000} land
+ * inside the data extent.  Two suppressions close that hole:
+ * {@link #isRealModeVideoSegment} (a documented constant heuristic for the video
+ * segments, which in a VGA game appear everywhere as far-pointer halves) and
+ * {@link #flowsIntoSegmentRegister} (straight-line dataflow: the loaded register
+ * is copied into ES/DS/SS within a few instructions).  Stock analysis never makes
+ * these refs &mdash; {@code ConstantPropagationAnalyzer} disables param-constant
+ * refs on segmented address spaces and resolves bare constants as segment-0
+ * addresses.</li>
  * </ul>
  * Per-shape register whitelists are measured, not assumed (enumerate
  * {@code ADD <reg>,0x}/{@code MOV <reg>,0x} over the program and judge the
@@ -65,13 +71,21 @@ import ghidra.util.task.TaskMonitor;
  * <li>{@code MOV AX,imm16} is excluded &mdash; measured ~90% false positives: DOS
  * int 21h AH:AL function selectors such as {@code 0x3D00}/{@code 0x4200} and low
  * words of 32-bit constants land in the data extent.</li>
- * <li>{@code ADD} takes all general registers including AX/CX/DX &mdash; measured
- * 2 false positives in 789 sites (a rand() LCG addend and one segment constant):
- * a large immediate added to a register is essentially always base-plus-index
- * address math, and the real g_players referents use CX and DX too.</li>
+ * <li>{@code ADD} takes all general registers including AX/CX/DX: a large
+ * immediate added to a register is essentially always base-plus-index address
+ * math, and the real g_players referents use CX and DX too.</li>
  * </ul>
- * Still out of scope: immediates of comparison and other arithmetic instructions
- * ({@code CMP}/{@code SUB}/{@code AND}/...), segment-overridden
+ * Two constants are excluded by value, both knowingly heuristic: the real-mode
+ * video segments ({@link #isRealModeVideoSegment}) and {@code 0x8000}
+ * (INT16_MIN/high-bit sentinel and 32-bit-constant high half; measured only as a
+ * constant, never as a global base).  Known accepted residuals on the corpus
+ * binary (2 refs of ~350): a rand() LCG addend ({@code ADD AX,0x9EC3}) and one
+ * bitmask ({@code MOV BX,0xC000} feeding {@code AND}) &mdash; large constants in
+ * genuine arithmetic that no syntactic gate can tell from an offset.  Still out
+ * of scope: immediates of comparison and other arithmetic instructions
+ * ({@code CMP}/{@code SUB}/{@code AND}/...), non-video segment constants pushed
+ * as far-pointer halves (only the video segments are excluded by value),
+ * segment-overridden
  * ({@code ES:}/{@code SS:}/{@code CS:}) accesses, fully-computed operands with no
  * displacement ({@code [BX+SI]}), and targets in executable blocks (the
  * initialized low-DGROUP region; stock constant propagation covers those).
@@ -263,6 +277,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 	private static int addAddressOfXref(Instruction instr, int opIndex, int dgroup,
 			Memory memory, ReferenceManager refManager, SegmentedAddressSpace space) {
 		String mnemonic = instr.getMnemonicString();
+		Register destReg = null;
 		if (mnemonic.equals("PUSH")) {
 			if (opIndex != 0 || instr.getNumOperands() != 1) {
 				return 0;
@@ -288,6 +303,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 			if (!allowed) {
 				return 0;
 			}
+			destReg = reg;
 		}
 		else {
 			return 0;
@@ -301,6 +317,19 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		if (value > 0xffff) {
 			return 0;
 		}
+		if (isRealModeVideoSegment(value)) {
+			return 0;
+		}
+		if (value == 0x8000) {
+			// INT16_MIN / high-bit sentinel, or the high half of a 32-bit
+			// constant pair (PUSH 0x8000 / PUSH 0x0).  Measured twice as a
+			// constant, never as a global base; a documented value exclusion
+			// like the video segments.
+			return 0;
+		}
+		if (destReg != null && flowsIntoSegmentRegister(instr, destReg)) {
+			return 0;
+		}
 
 		Address target = space.getAddress(dgroup, (int) value);
 		if (!isMappedDataTarget(target, memory)) {
@@ -310,6 +339,57 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		refManager.addMemoryReference(instr.getAddress(), target, RefType.DATA,
 			SourceType.ANALYSIS, opIndex);
 		return 1;
+	}
+
+	/**
+	 * Real-mode video memory segments ({@code A000}/{@code B000}/{@code B800}).  A
+	 * pure constant exclusion, and knowingly heuristic: these values land inside
+	 * the data block, so the block guard cannot reject them, yet in a VGA-era
+	 * program they are far-pointer segment halves ({@code PUSH 0xA000} before the
+	 * offset push) or segment loads, never DGROUP offsets &mdash; measured 20 of
+	 * 20 on the corpus binary.  What this cannot catch: any <i>other</i> constant
+	 * used as a segment that happens to fall in the data extent (e.g. arbitrary
+	 * far-pointer halves); those are only suppressed when
+	 * {@link #flowsIntoSegmentRegister} can see the segment load.
+	 */
+	private static boolean isRealModeVideoSegment(long value) {
+		return value == 0xa000 || value == 0xb000 || value == 0xb800;
+	}
+
+	/**
+	 * True if the register just loaded with the immediate is copied into a
+	 * segment register within the next few fall-through instructions
+	 * ({@code MOV DI,0xA000} / {@code MOV ES,DI}) &mdash; the immediate is a
+	 * segment, not an offset.  Deliberately shallow: follows straight-line code
+	 * only, stops at any flow instruction or when the register is rewritten.
+	 */
+	private static boolean flowsIntoSegmentRegister(Instruction instr, Register reg) {
+		Listing listing = instr.getProgram().getListing();
+		Instruction cur = instr;
+		for (int i = 0; i < 4; i++) {
+			Address ft = cur.getFallThrough();
+			if (ft == null) {
+				return false;
+			}
+			cur = listing.getInstructionAt(ft);
+			if (cur == null || cur.getFlowType().isCall()) {
+				return false;
+			}
+			if (cur.getMnemonicString().equals("MOV")) {
+				Object[] dst = cur.getOpObjects(0);
+				Object[] src = cur.getOpObjects(1);
+				if (dst.length == 1 && dst[0] instanceof Register dstReg &&
+					isSegmentRegister(dstReg) && src.length == 1 && src[0] == reg) {
+					return true;
+				}
+			}
+			for (Object obj : cur.getResultObjects()) {
+				if (obj == reg) {
+					return false; // value replaced before any segment load
+				}
+			}
+		}
+		return false;
 	}
 
 	private static boolean isAddressRegister(Register reg) {
