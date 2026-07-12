@@ -18,12 +18,14 @@ package ghidra.app.plugin.core.analysis;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.TreeSet;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
@@ -547,25 +549,16 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			// Note the module bases known from the relocation table in the block
 			// comment; CS-relative absolute offsets in module code (e.g. switch jump
-			// tables) are relative to these paragraphs, not to the page start.
-			StringBuilder comment = new StringBuilder(
-				String.format("RTLink/Plus overlay page %d (frame=0x%X)",
-					page.getPageIndex() - 1, page.getFrameSize()));
-			SortedSet<Integer> moduleBases = page.getModuleBases();
-			if (moduleBases.size() > 1) {
-				comment.append(", module base paragraphs:");
-				for (int base : moduleBases) {
-					comment.append(String.format(" 0x%X", base));
-				}
-			}
-
+			// tables) are relative to these paragraphs, not to the page start. The
+			// stub scan later contributes the modules the relocation table cannot
+			// name (see mergeStubModuleBases).
 			MemoryBlock block = MemoryBlockUtils.createInitializedBlock(program, true,
 				blockName, overlayBase, fileBytes, codeFileOffset, codeSize,
-				comment.toString(), "RTLink", true, false, true, log);
+				blockComment(page, page.getModuleBases()), "RTLink", true, false, true, log);
 
 			if (block != null) {
 				result.add(new OverlayBlockInfo(page, block));
-				recordModuleBases(program, blockName, page);
+				recordModuleBases(program, blockName, page.getModuleBases());
 			}
 			else {
 				log.appendMsg(
@@ -578,21 +571,84 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * Record {@code page}'s module base paragraphs in program info (see
-	 * {@link #MODULE_BASES_PREFIX}) so {@link RTLinkSwitchTableAnalyzer} can resolve
-	 * module-relative switch-table displacements in the overlay block.
+	 * Record {@code bases} as the module base paragraphs of {@code blockName} in program
+	 * info (see {@link #MODULE_BASES_PREFIX}) so {@link RTLinkSwitchTableAnalyzer} can
+	 * resolve module-relative switch-table displacements in the overlay block.
 	 */
 	private static void recordModuleBases(Program program, String blockName,
-			RTLinkOverlayPage page) {
-		StringBuilder bases = new StringBuilder();
-		for (int base : page.getModuleBases()) {
-			if (bases.length() > 0) {
-				bases.append(',');
+			Collection<Integer> bases) {
+		StringBuilder text = new StringBuilder();
+		for (int base : bases) {
+			if (text.length() > 0) {
+				text.append(',');
 			}
-			bases.append(Integer.toHexString(base));
+			text.append(Integer.toHexString(base));
 		}
 		program.getOptions(Program.PROGRAM_INFO)
-				.setString(MODULE_BASES_PREFIX + blockName, bases.toString());
+				.setString(MODULE_BASES_PREFIX + blockName, text.toString());
+	}
+
+	/** The overlay block's comment, naming {@code bases} as its module base paragraphs. */
+	private static String blockComment(RTLinkOverlayPage page, Collection<Integer> bases) {
+		StringBuilder comment = new StringBuilder(
+			String.format("RTLink/Plus overlay page %d (frame=0x%X)",
+				page.getPageIndex() - 1, page.getFrameSize()));
+		if (bases.size() > 1) {
+			comment.append(", module base paragraphs:");
+			for (int base : bases) {
+				comment.append(String.format(" 0x%X", base));
+			}
+		}
+		return comment.toString();
+	}
+
+	/**
+	 * Fold the module bases observed in the dispatch stubs into each page's recorded set.
+	 * <p>
+	 * A page's relocation table only names a module that some relocation is <i>sited</i>
+	 * in, so a module carrying no segment fixups of its own is invisible there — yet the
+	 * 14-byte stubs that call into it still spell out its base paragraph. In VICEROY.EXE
+	 * this is the sole module of OVERLAY_02 (0x642) and the sixth of OVERLAY_28 (0x67);
+	 * both are confirmed by the segment list, whose per-page flag word marks OVERLAY_02
+	 * as multi-module even though its 652 relocations are all module 0.
+	 * <p>
+	 * Without this the two sets disagree and {@link RTLinkSwitchTableAnalyzer} — which
+	 * anchors a CS-relative displacement to the module containing the dispatch — cannot
+	 * place a switch table in such a module, so it (correctly, but needlessly) rejects it.
+	 */
+	private void mergeStubModuleBases(Program program, List<OverlayBlockInfo> overlayBlocks,
+			Map<String, SortedSet<Integer>> stubModuleBases) {
+		int pagesExtended = 0;
+		int basesAdded = 0;
+
+		for (OverlayBlockInfo info : overlayBlocks) {
+			String blockName = info.block().getName();
+			SortedSet<Integer> fromStubs = stubModuleBases.get(blockName);
+			if (fromStubs == null) {
+				continue;
+			}
+
+			SortedSet<Integer> merged = new TreeSet<>(info.page().getModuleBases());
+			int before = merged.size();
+			merged.addAll(fromStubs);
+			if (merged.size() == before) {
+				continue;
+			}
+
+			recordModuleBases(program, blockName, merged);
+			info.block().setComment(blockComment(info.page(), merged));
+			pagesExtended++;
+			basesAdded += merged.size() - before;
+		}
+
+		if (pagesExtended > 0) {
+			// Msg.info only, never log.appendMsg: any content in the analysis MessageLog
+			// makes AutoAnalysisPlugin pop a "warnings/errors issued during analysis"
+			// dialog, and this is a clean-run success count.
+			Msg.info(this, String.format(
+				"RTLink/Plus: Added %d stub-only module base(s) across %d overlay page(s)",
+				basesAdded, pagesExtended));
+		}
 	}
 
 	private void applyOverlayRelocations(Program program, OverlayBlockInfo info,
@@ -638,6 +694,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			throws CancelledException {
 		AddressSet overlayEntryPoints = new AddressSet();
 		List<StubTarget> pendingThunks = new ArrayList<>();
+		Map<String, SortedSet<Integer>> stubModuleBases = new HashMap<>();
 
 		Set<Long> dispatchers = discoverDispatchers(program, monitor);
 		if (!dispatchers.isEmpty()) {
@@ -646,8 +703,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 
 		int jmpfStubs = scanForJmpfStubs(program, overlayBlocks, dispatchers,
-			overlayEntryPoints, pendingThunks, log, monitor);
+			overlayEntryPoints, pendingThunks, stubModuleBases, log, monitor);
 		int int3fStubs = 0;
+
+		// The stubs are the only place a module carrying no relocations is named, so
+		// fold what they revealed into each page's module base set before the switch
+		// table analyzer reads it back.
+		mergeStubModuleBases(program, overlayBlocks, stubModuleBases);
 
 		if (jmpfStubs == 0) {
 			int3fStubs = scanForInt3fStubs(program, overlayBlocks, overlayEntryPoints,
@@ -832,11 +894,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * 12 bytes; otherwise a word at +12 smaller than the page's total paragraph count
 	 * is a module_word. The module_word cannot be validated against the page's
 	 * relocation seg_index values ({@link RTLinkOverlayPage#getModuleBases()}) — a
-	 * module referenced only by stubs never appears there.
+	 * module referenced only by stubs never appears there. Every module_word observed
+	 * here is collected into {@code stubModuleBases}, keyed by overlay block name, so
+	 * {@link #mergeStubModuleBases} can complete each page's set with exactly those
+	 * modules the relocation table cannot name.
 	 */
 	private int scanForJmpfStubs(Program program, List<OverlayBlockInfo> overlayBlocks,
 			Set<Long> dispatchers, AddressSet overlayEntryPoints,
-			List<StubTarget> pendingThunks, MessageLog log, TaskMonitor monitor)
+			List<StubTarget> pendingThunks, Map<String, SortedSet<Integer>> stubModuleBases,
+			MessageLog log, TaskMonitor monitor)
 			throws CancelledException {
 		if (overlayBlocks.isEmpty() || dispatchers.isEmpty()) {
 			return 0;
@@ -938,6 +1004,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					if (!target.block().contains(targetAddr)) {
 						searchAddr = searchAddr.add(1);
 						continue;
+					}
+
+					// Only now that the stub has fully checked out is its module_word
+					// trustworthy enough to record as one of the page's module bases.
+					if (moduleBase != 0) {
+						stubModuleBases
+								.computeIfAbsent(target.block().getName(), k -> new TreeSet<>())
+								.add(moduleBase);
 					}
 
 					Address stubAddr = callfAddr;
@@ -1398,7 +1472,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				overlayBlocks.add(new OverlayBlockInfo(page, block));
 				// Retrofit the module base record onto programs imported before it
 				// existed, so overlay switch-table recovery works there on re-analysis.
-				recordModuleBases(program, block.getName(), page);
+				// discoverAndProcessStubs() then merges in the stub-only modules.
+				recordModuleBases(program, block.getName(), page.getModuleBases());
 			}
 
 			discoverAndProcessStubs(program, overlayBlocks, log, monitor);
