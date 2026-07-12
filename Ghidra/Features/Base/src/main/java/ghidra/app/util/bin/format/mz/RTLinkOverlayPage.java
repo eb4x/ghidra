@@ -106,8 +106,10 @@ public class RTLinkOverlayPage {
 
 	/**
 	 * The page's third relocation list. Empty on every page of every binary seen so far;
-	 * the RTLink runtime reads its count, but no observed executable uses it. Parsed but
-	 * not applied, exactly like {@link #getSecondRelocations()}.
+	 * the RTLink runtime reads its count, but the RTLink/Plus 6.10 linker has been shown
+	 * unable to emit one (see {@link RTLinkPageHeader}), so a nonzero count would signal a
+	 * different linker version. Parsed but not applied, exactly like
+	 * {@link #getSecondRelocations()}.
 	 */
 	public List<RTLinkRelocation> getThirdRelocations() {
 		return thirdRelocations;
