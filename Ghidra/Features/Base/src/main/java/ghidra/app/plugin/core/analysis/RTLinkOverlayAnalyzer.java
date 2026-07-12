@@ -660,20 +660,53 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		// The runtime fixup loop (210d:2e59 in VICEROY.EXE) addresses each patch
 		// site as (frame + seg_index):offset — page-linear seg_index*16 + offset —
-		// and adds the same load delta to the unrelocated segment word found there,
-		// regardless of seg_index. The delta is the segment the resident image was
-		// loaded at: MzLoader bases it at INITIAL_SEGMENT_VAL without setting the
-		// program image base, so getImageBase() would yield 0 here.
+		// and adds a delta to the unrelocated segment word found there, regardless of
+		// seg_index. The two lists differ only in what that word points at, and hence
+		// in which delta it takes.
+		//
+		// List 1: the word is a segment in the RESIDENT IMAGE. It takes the image load
+		// delta, once. MzLoader bases the image at INITIAL_SEGMENT_VAL without setting
+		// the program image base, so getImageBase() would yield 0 here.
+		//
+		// List 2: the word is a PAGE-RELATIVE segment — a paragraph offset within the
+		// page (0 = the page's own base, or one of its module bases). Verified against
+		// the corpus: 211 of 211 list-2 sites across NEBULAR, ROE2MAIN and SPHERE hold a
+		// value below their page's paragraph count, while list-1 sites essentially never
+		// do. The runtime resolves such a site as frame + value, and re-applies the
+		// difference every time the page moves (that is the whole reason the linker keeps
+		// them in a separate list). Statically the page's "frame" is the overlay block's
+		// own base segment, so that is the delta to add here.
+		//
+		// Both deltas happen to be 0x1000 today — the image base and the overlay block
+		// base coincide — but they are not the same quantity, so derive each one. The
+		// block's start cannot be cast to SegmentedAddress (an overlay of a segmented
+		// space hands back a GenericAddress), so take its paragraph from the offset.
 		int loadDelta = INITIAL_SEGMENT_VAL;
+		int frameDelta = (int) (blockStart.getOffset() >>> 4) & 0xffff;
 
-		for (RTLinkRelocation reloc : page.getRelocations()) {
+		applyRelocationList(program, memory, blockStart, page.getRelocations(), loadDelta,
+			pageDisplay, log);
+		applyRelocationList(program, memory, blockStart, page.getSecondRelocations(),
+			frameDelta, pageDisplay, log);
+
+		// List 3 is still not applied: nothing in the corpus has one (reloc_count_3 is 0
+		// on every page of every binary seen), so there is no way to check an answer, and
+		// the runtime gives it a different base segment again.
+	}
+
+	/**
+	 * Add {@code delta} to the unrelocated segment word at each of {@code relocations}'
+	 * sites, and record the fixups in the relocation table.
+	 */
+	private void applyRelocationList(Program program, Memory memory, Address blockStart,
+			List<RTLinkRelocation> relocations, int delta, int pageDisplay, MessageLog log) {
+		for (RTLinkRelocation reloc : relocations) {
 			int siteOffset = reloc.getSiteOffset();
 
 			try {
 				Address relocAddr = blockStart.add(siteOffset);
 				short currentValue = memory.getShort(relocAddr);
-				int segmentValue =
-					(Short.toUnsignedInt(currentValue) + loadDelta) & 0xffff;
+				int segmentValue = (Short.toUnsignedInt(currentValue) + delta) & 0xffff;
 
 				memory.setShort(relocAddr, (short) segmentValue);
 
