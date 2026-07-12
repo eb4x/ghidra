@@ -144,10 +144,10 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 		// back into the table bytes.
 		new DisassembleCommand(targets, null, true).applyTo(program, monitor);
 
-		String msg = String.format("RTLink/Plus: Recovered %d CS-relative switch table(s)",
-			recovered);
-		Msg.info(this, msg);
-		log.appendMsg(msg);
+		// Msg.info only — see RTLinkSwitchOverrideAnalyzer: a success count in the analysis
+		// MessageLog pops the "warnings/errors issued during analysis" dialog.
+		Msg.info(this, String.format("RTLink/Plus: Recovered %d CS-relative switch table(s)",
+			recovered));
 		return true;
 	}
 

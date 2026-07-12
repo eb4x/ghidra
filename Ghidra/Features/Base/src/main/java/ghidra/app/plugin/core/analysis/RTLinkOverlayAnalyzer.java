@@ -349,9 +349,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			return;
 		}
 		program.getOptions(Program.PROGRAM_INFO).setBoolean(DS_ASSUMED_FLAG, true);
+		// Msg.info only, never log.appendMsg: any content in the analysis MessageLog makes
+		// AutoAnalysisPlugin.analysisEnded() pop a "There were warnings/errors issued during
+		// analysis" dialog. The MessageLog above is for the paths where DS could not be assumed.
 		Msg.info(this, String.format(
 			"RTLink: Assuming DS = 0x%04X (DGROUP) over %d executable blocks", dgroup, blocks));
-		log.appendMsg(String.format("RTLink: Assuming DS = 0x%04X (DGROUP)", dgroup));
 	}
 
 	private static Address firstEntryPoint(Program program) {
