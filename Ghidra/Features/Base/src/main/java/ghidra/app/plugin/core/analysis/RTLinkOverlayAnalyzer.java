@@ -99,6 +99,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	/** PROGRAM_INFO property set once DS (DGROUP) has been assumed, so re-runs don't redo it. */
 	static final String DS_ASSUMED_FLAG = "RTLink Data Segment Assumed";
 
+	/**
+	 * Program-info key prefix, completed with an overlay block's name, recording the
+	 * page's module base paragraphs as comma-separated hex — the anchor points that
+	 * CS-relative displacements in module code are relative to. Read back by
+	 * {@link RTLinkSwitchTableAnalyzer} to resolve overlay switch tables.
+	 */
+	static final String MODULE_BASES_PREFIX = "RTLink Module Bases ";
+
 	private static final int INITIAL_SEGMENT_VAL = 0x1000;
 
 	static final byte OPCODE_CALLF = (byte) 0x9A;
@@ -555,6 +563,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			if (block != null) {
 				result.add(new OverlayBlockInfo(page, block));
+				recordModuleBases(program, blockName, page);
 			}
 			else {
 				log.appendMsg(
@@ -564,6 +573,24 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		Msg.debug(this, "RTLink/Plus: Created " + result.size() + " overlay memory blocks");
 		return result;
+	}
+
+	/**
+	 * Record {@code page}'s module base paragraphs in program info (see
+	 * {@link #MODULE_BASES_PREFIX}) so {@link RTLinkSwitchTableAnalyzer} can resolve
+	 * module-relative switch-table displacements in the overlay block.
+	 */
+	private static void recordModuleBases(Program program, String blockName,
+			RTLinkOverlayPage page) {
+		StringBuilder bases = new StringBuilder();
+		for (int base : page.getModuleBases()) {
+			if (bases.length() > 0) {
+				bases.append(',');
+			}
+			bases.append(Integer.toHexString(base));
+		}
+		program.getOptions(Program.PROGRAM_INFO)
+				.setString(MODULE_BASES_PREFIX + blockName, bases.toString());
 	}
 
 	private void applyOverlayRelocations(Program program, OverlayBlockInfo info,
@@ -1185,6 +1212,19 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	private static void createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
 			Address targetAddr, int stubSize, MessageLog log) {
+		// A CALLF+JMPF pair inside a larger function's body is fallthrough-reachable
+		// code, not a free-standing stub — the overlay manager's own code contains
+		// guarded dispatcher calls (TEST flag / JNZ past / CALLF dispatcher / JMPF)
+		// whose tail is byte-identical to a trampoline. Carving a thunk there would
+		// split the containing function, so leave the site alone.
+		Function containing = funcMgr.getFunctionContaining(stubAddr);
+		if (containing != null && !containing.getEntryPoint().equals(stubAddr)) {
+			Msg.debug(RTLinkOverlayAnalyzer.class, String.format(
+				"RTLink: skipping stub thunk at %s -> %s: embedded in %s at %s",
+				stubAddr, targetAddr, containing.getName(), containing.getEntryPoint()));
+			return;
+		}
+
 		Function overlayFunc = funcMgr.getFunctionAt(targetAddr);
 		if (overlayFunc == null) {
 			try {
@@ -1354,6 +1394,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					return;
 				}
 				overlayBlocks.add(new OverlayBlockInfo(page, block));
+				// Retrofit the module base record onto programs imported before it
+				// existed, so overlay switch-table recovery works there on re-analysis.
+				recordModuleBases(program, block.getName(), page);
 			}
 
 			discoverAndProcessStubs(program, overlayBlocks, log, monitor);

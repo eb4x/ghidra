@@ -33,6 +33,7 @@ import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
@@ -71,15 +72,21 @@ import ghidra.util.task.TaskMonitor;
  * Fixing the references leaves the decompiler's own p-code still reading the table at the page
  * segment. {@link RTLinkSwitchOverrideAnalyzer} completes the repair once functions exist.
  * <p>
- * Overlay blocks are deliberately untouched: they are based at {@code 1000:0000}, so the paragraph
- * {@code currentCS} synthesises is already the right one.
+ * <b>Overlay blocks</b> fail differently. They are based at {@code 1000:0000}, so the paragraph
+ * {@code currentCS} synthesises is right — but only for the page's <i>first</i> module. RTLink
+ * packs several link-time modules into one page, and each executes with CS = page frame + its own
+ * base paragraph, so a dispatch in a later module reads its table (and interprets every entry)
+ * relative to that module base, which nothing in the address stream reveals. The bases are
+ * recorded per block by {@link RTLinkOverlayAnalyzer} when the overlay is created; the module
+ * containing the dispatch is the one whose base is nearest at or below it.
  */
 public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 
 	private static final String NAME = "RTLink/Plus Switch Table";
 	private static final String DESCRIPTION =
 		"Recovers CS-relative jump tables in resident code whose segment is not 64KB-page " +
-			"aligned, which the x86 currentCS constructor resolves against the wrong paragraph.";
+			"aligned, which the x86 currentCS constructor resolves against the wrong paragraph, " +
+			"and module-relative jump tables in overlay pages.";
 
 	/** {@code JMP word ptr CS:[BX + disp16]} — CS prefix, opcode FF /4, mod=10 r/m=111. */
 	private static final byte[] DISPATCH_OPCODE = { 0x2e, (byte) 0xff, (byte) 0xa7 };
@@ -145,15 +152,21 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * Returns the switch destinations for {@code instruction} if it is a resident CS-relative
+	 * Returns the switch destinations for {@code instruction} if it is a CS-relative
 	 * dispatch whose table can be read with confidence, otherwise null.
 	 * <p>
 	 * Shared with {@link RTLinkSwitchOverrideAnalyzer} so both passes agree, byte for byte, on
 	 * which sites are dispatchers and where they go.
 	 */
 	static List<Address> recoverTable(Program program, Instruction instruction) {
-		MemoryBlock block = residentUnalignedBlock(program, instruction.getMinAddress());
-		if (block == null) {
+		MemoryBlock block = program.getMemory().getBlock(instruction.getMinAddress());
+		if (block == null || !block.isExecute()) {
+			return null;
+		}
+		if (block.isOverlay()) {
+			return recoverOverlayTable(program, instruction, block);
+		}
+		if (!isUnalignedSegment(block)) {
 			return null;
 		}
 		int displacement = dispatchDisplacement(instruction);
@@ -199,20 +212,113 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * The block containing {@code address}, if it is resident code based at a paragraph that is not
-	 * a 64KB-page boundary — exactly the case {@code currentCS} gets wrong. Page-aligned blocks and
-	 * overlays already resolve correctly and must not be touched.
+	 * Overlay variant of {@link #recoverTable}. The dispatch's module is the one whose
+	 * recorded base paragraph is nearest at or below it, ending at the next base (or the
+	 * block end); the table displacement and every table entry are offsets from that
+	 * base, mirroring the module's runtime CS.
+	 * <p>
+	 * The recorded base set is not exhaustive — a module referenced by no relocation
+	 * does not appear — and a missing base would make this resolve against the previous
+	 * module. Guarding against that, the table is rejected whole if any entry escapes
+	 * the module or lands in the middle of an existing instruction (overlay code
+	 * reachable from dispatch stubs is already disassembled when this runs).
 	 */
-	private static MemoryBlock residentUnalignedBlock(Program program, Address address) {
-		MemoryBlock block = program.getMemory().getBlock(address);
-		if (block == null || block.isOverlay() || !block.isExecute()) {
+	private static List<Address> recoverOverlayTable(Program program, Instruction instruction,
+			MemoryBlock block) {
+		int displacement = dispatchDisplacement(instruction);
+		if (displacement < 0) {
 			return null;
 		}
-		if (!(block.getStart() instanceof SegmentedAddress start)) {
+		int entries = tableEntryCount(instruction, block);
+		if (entries < 0) {
 			return null;
+		}
+		List<Integer> bases = moduleBases(program, block);
+		if (bases == null) {
+			return null; // no record (block predates it and no re-analysis ran) — leave alone
+		}
+
+		Address start = block.getStart();
+		long blockSize = block.getEnd().subtract(start) + 1;
+		long dispatchOffset = instruction.getMinAddress().subtract(start);
+		long moduleStart = -1;
+		long moduleEnd = blockSize;
+		for (int base : bases) {
+			long paragraphOffset = base * 16L;
+			if (paragraphOffset <= dispatchOffset) {
+				moduleStart = paragraphOffset;
+			}
+			else {
+				moduleEnd = Math.min(paragraphOffset, blockSize);
+				break;
+			}
+		}
+		if (moduleStart < 0) {
+			return null;
+		}
+
+		long lastByte = (long) displacement + 2L * entries - 1;
+		if (lastByte > 0xffffL || moduleStart + lastByte >= moduleEnd) {
+			return null;
+		}
+		Address table = start.add(moduleStart + displacement);
+
+		Set<Address> destinations = new LinkedHashSet<>();
+		Listing listing = program.getListing();
+		try {
+			for (int i = 0; i < entries; i++) {
+				int offset = program.getMemory().getShort(table.add(2L * i)) & 0xffff;
+				long destinationOffset = moduleStart + offset;
+				if (destinationOffset >= moduleEnd) {
+					return null;
+				}
+				Address destination = start.add(destinationOffset);
+				Instruction existing = listing.getInstructionContaining(destination);
+				if (existing != null && !existing.getMinAddress().equals(destination)) {
+					return null; // mid-instruction target: the base resolution is wrong
+				}
+				destinations.add(destination);
+			}
+		}
+		catch (MemoryAccessException e) {
+			return null;
+		}
+		return new ArrayList<>(destinations);
+	}
+
+	/**
+	 * The module base paragraphs {@link RTLinkOverlayAnalyzer} recorded for {@code block}
+	 * when it created the overlay, sorted ascending, or null if there is no (valid) record.
+	 */
+	private static List<Integer> moduleBases(Program program, MemoryBlock block) {
+		String recorded = program.getOptions(Program.PROGRAM_INFO).getString(
+			RTLinkOverlayAnalyzer.MODULE_BASES_PREFIX + block.getName(), null);
+		if (recorded == null || recorded.isEmpty()) {
+			return null;
+		}
+		List<Integer> bases = new ArrayList<>();
+		for (String base : recorded.split(",")) {
+			try {
+				bases.add(Integer.parseInt(base.trim(), 16));
+			}
+			catch (NumberFormatException e) {
+				return null;
+			}
+		}
+		return bases;
+	}
+
+	/**
+	 * True if {@code block} is based at a paragraph that is not a 64KB-page boundary —
+	 * exactly the case {@code currentCS} gets wrong. Page-aligned blocks already resolve
+	 * correctly and must not be touched.
+	 */
+	private static boolean isUnalignedSegment(MemoryBlock block) {
+		if (!(block.getStart() instanceof SegmentedAddress start)) {
+			return false;
 		}
 		int pageSegment = (int) ((start.getOffset() >> 4) & 0xf000L);
-		return start.getSegment() == pageSegment ? null : block;
+		return start.getSegment() != pageSegment;
 	}
 
 	/** The {@code disp16} of a {@code JMP word ptr CS:[BX + disp16]}, or -1 if not one. */
