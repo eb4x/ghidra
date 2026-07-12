@@ -34,7 +34,8 @@ import ghidra.program.model.symbol.ReferenceManager;
 
 /**
  * Regression test for {@link RTLinkXrefAnalyzer#addDataXrefs}: the address-of
- * immediate pass ({@code PUSH imm16} / {@code MOV BX/SI/DI,imm16} whose value
+ * immediate pass ({@code PUSH imm16} / {@code MOV BX/SI/DI,imm16} /
+ * {@code ADD AX/BX/CX/DX/SI/DI,imm16} whose value
  * lands in a mapped non-executable block gets a DATA reference) and its guards,
  * plus the pre-existing DS-relative dereference pass.  The memory map mirrors
  * VICEROY.EXE's DGROUP: an executable low block (its CODE_104) whose extent
@@ -59,13 +60,16 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 
 			builder.setBytes("0x1000:0x0000",
 			// @formatter:off
-				"68 10 10 " + // 0x0000  PUSH 0x1010     -> BSS: DATA ref, opIndex 0
-				"be 20 10 " + // 0x0003  MOV SI,0x1020   -> BSS: DATA ref, opIndex 1
-				"68 50 00 " + // 0x0006  PUSH 0x50       -> executable block: no ref
-				"68 00 30 " + // 0x0009  PUSH 0x3000     -> unmapped: no ref
-				"b9 10 10 " + // 0x000c  MOV CX,0x1010   -> disallowed register: no ref
-				"b8 10 10 " + // 0x000f  MOV AX,0x1010   -> AX excluded (DOS selectors): no ref
-				"a1 10 10",   // 0x0012  MOV AX,[0x1010] -> deref pass: READ ref
+				"68 10 10 " +    // 0x0000  PUSH 0x1010     -> BSS: DATA ref, opIndex 0
+				"be 20 10 " +    // 0x0003  MOV SI,0x1020   -> BSS: DATA ref, opIndex 1
+				"68 50 00 " +    // 0x0006  PUSH 0x50       -> executable block: no ref
+				"68 00 30 " +    // 0x0009  PUSH 0x3000     -> unmapped: no ref
+				"b9 10 10 " +    // 0x000c  MOV CX,0x1010   -> disallowed register: no ref
+				"b8 10 10 " +    // 0x000f  MOV AX,0x1010   -> AX excluded (DOS selectors): no ref
+				"05 10 10 " +    // 0x0012  ADD AX,0x1010   -> &g[i] idiom, AX allowed: DATA ref
+				"81 c1 30 10 " + // 0x0015  ADD CX,0x1030   -> CX allowed for ADD: DATA ref
+				"81 c5 10 10 " + // 0x0019  ADD BP,0x1010   -> BP excluded: no ref
+				"a1 10 10",      // 0x001d  MOV AX,[0x1010] -> deref pass: READ ref
 			// @formatter:on
 				true);
 			builder.setRegisterValue("DS", "0x1000:0x0000", "0x1000:0x001f", 0x2000);
@@ -86,7 +90,7 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 				}
 			});
 
-			assertEquals("address-of refs", 2, counts.addressOf);
+			assertEquals("address-of refs", 4, counts.addressOf);
 			assertEquals("deref refs", 1, counts.deref);
 
 			Reference[] push = refManager.getReferencesFrom(builder.addr("0x1000:0x0000"));
@@ -110,7 +114,21 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 			assertEquals("MOV AX,imm must not ref", 0,
 				refManager.getReferencesFrom(builder.addr("0x1000:0x000f")).length);
 
-			Reference[] deref = refManager.getReferencesFrom(builder.addr("0x1000:0x0012"));
+			Reference[] addAx = refManager.getReferencesFrom(builder.addr("0x1000:0x0012"));
+			assertEquals(1, addAx.length);
+			assertEquals(RefType.DATA, addAx[0].getReferenceType());
+			assertEquals(builder.addr("0x2000:0x1010"), addAx[0].getToAddress());
+			assertEquals(1, addAx[0].getOperandIndex());
+
+			Reference[] addCx = refManager.getReferencesFrom(builder.addr("0x1000:0x0015"));
+			assertEquals(1, addCx.length);
+			assertEquals(RefType.DATA, addCx[0].getReferenceType());
+			assertEquals(builder.addr("0x2000:0x1030"), addCx[0].getToAddress());
+
+			assertEquals("ADD BP,imm must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0019")).length);
+
+			Reference[] deref = refManager.getReferencesFrom(builder.addr("0x1000:0x001d"));
 			assertEquals(1, deref.length);
 			assertTrue("deref pass must still make READ refs",
 				deref[0].getReferenceType().isRead());

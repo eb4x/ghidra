@@ -44,24 +44,37 @@ import ghidra.util.task.TaskMonitor;
  * {@code assumeDataSegmentRegister}), so the target {@code DGROUP:offset} is fully
  * known, and {@link Instruction#getOperandRefType(int)} distinguishes READ from
  * WRITE from the operand p-code.</li>
- * <li><b>Address-of immediates</b> &mdash; {@code PUSH imm16} and
- * {@code MOV BX/SI/DI,imm16} whose immediate, resolved against the same assumed
- * DS, lands in a mapped non-executable block get {@link RefType#DATA} references.
- * Globals only ever passed by address ({@code fread(&g_players, ...)} compiles to
- * {@code PUSH 0x540e}) otherwise show zero xrefs.  The block guard is the
- * false-positive bound: every small coincidental constant falls below the data
- * block's start offset.  Stock analysis never makes these &mdash;
- * {@code ConstantPropagationAnalyzer} disables param-constant refs on segmented
- * address spaces and resolves bare constants as segment-0 addresses.</li>
+ * <li><b>Address-of immediates</b> &mdash; {@code PUSH imm16},
+ * {@code MOV BX/SI/DI,imm16}, and {@code ADD AX/BX/CX/DX/SI/DI,imm16} whose
+ * immediate, resolved against the same assumed DS, lands in a mapped
+ * non-executable block get {@link RefType#DATA} references.  Globals only ever
+ * passed by address ({@code fread(&g_players, ...)} compiles to
+ * {@code PUSH 0x540e}) otherwise show zero xrefs, and for array-typed globals the
+ * dominant referent shape is the indexing idiom &mdash; {@code &g_players[i]}
+ * compiles to a scaled index plus {@code ADD reg,0x540e} (27 of g_players' 29 real
+ * referents).  The block guard is the false-positive bound: every small
+ * coincidental constant falls below the data block's start offset.  Stock
+ * analysis never makes these &mdash; {@code ConstantPropagationAnalyzer} disables
+ * param-constant refs on segmented address spaces and resolves bare constants as
+ * segment-0 addresses.</li>
  * </ul>
- * Still out of scope: immediates of arithmetic/comparison instructions (only the
- * PUSH and MOV-into-address-register shapes are considered), {@code MOV AX,imm16}
- * (measured ~90% false positives: DOS int 21h AH:AL function selectors such as
- * {@code 0x3D00}/{@code 0x4200} and low words of 32-bit constants land in the data
- * extent), segment-overridden ({@code ES:}/{@code SS:}/{@code CS:}) accesses,
- * fully-computed operands with no displacement ({@code [BX+SI]}), and targets in
- * executable blocks (the initialized low-DGROUP region; stock constant
- * propagation covers those).
+ * Per-shape register whitelists are measured, not assumed (enumerate
+ * {@code ADD <reg>,0x}/{@code MOV <reg>,0x} over the program and judge the
+ * in-range immediates):
+ * <ul>
+ * <li>{@code MOV AX,imm16} is excluded &mdash; measured ~90% false positives: DOS
+ * int 21h AH:AL function selectors such as {@code 0x3D00}/{@code 0x4200} and low
+ * words of 32-bit constants land in the data extent.</li>
+ * <li>{@code ADD} takes all general registers including AX/CX/DX &mdash; measured
+ * 2 false positives in 789 sites (a rand() LCG addend and one segment constant):
+ * a large immediate added to a register is essentially always base-plus-index
+ * address math, and the real g_players referents use CX and DX too.</li>
+ * </ul>
+ * Still out of scope: immediates of comparison and other arithmetic instructions
+ * ({@code CMP}/{@code SUB}/{@code AND}/...), segment-overridden
+ * ({@code ES:}/{@code SS:}/{@code CS:}) accesses, fully-computed operands with no
+ * displacement ({@code [BX+SI]}), and targets in executable blocks (the
+ * initialized low-DGROUP region; stock constant propagation covers those).
  */
 public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 
@@ -70,7 +83,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		"Creates the cross-references the stock operand analyzer skips in 16-bit " +
 			"address spaces: far call/jump xrefs from overlay code to main program " +
 			"routines, DS-relative data read/write xrefs (DGROUP globals), and " +
-			"address-of immediate xrefs (PUSH/MOV of a DGROUP data offset).";
+			"address-of immediate xrefs (PUSH/MOV/ADD of a DGROUP data offset).";
 
 	public RTLinkXrefAnalyzer() {
 		super(NAME, DESCRIPTION, AnalyzerType.INSTRUCTION_ANALYZER);
@@ -242,9 +255,10 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 
 	/**
 	 * Address-of pass: create a DATA reference for a pure imm16 operand of
-	 * {@code PUSH imm16} or {@code MOV BX/SI/DI,imm16} whose value, resolved
-	 * against DS=DGROUP, lands in a mapped non-executable block.  Returns the
-	 * number of references created (0 or 1).
+	 * {@code PUSH imm16}, {@code MOV BX/SI/DI,imm16}, or
+	 * {@code ADD AX/BX/CX/DX/SI/DI,imm16} whose value, resolved against
+	 * DS=DGROUP, lands in a mapped non-executable block.  Returns the number of
+	 * references created (0 or 1).
 	 */
 	private static int addAddressOfXref(Instruction instr, int opIndex, int dgroup,
 			Memory memory, ReferenceManager refManager, SegmentedAddressSpace space) {
@@ -254,17 +268,24 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 				return 0;
 			}
 		}
-		else if (mnemonic.equals("MOV")) {
-			// Only moves into a register plausibly used as a pointer.  CX and DX
-			// carry counts and sizes; AX carries DOS int 21h AH:AL function
-			// selectors and the low words of 32-bit constants, which dominate its
-			// in-range immediates.
+		else if (mnemonic.equals("MOV") || mnemonic.equals("ADD")) {
+			// Register whitelists are measured per shape (see the class javadoc).
+			// MOV: only registers plausibly used as pointers — CX and DX carry
+			// counts and sizes, and AX carries DOS int 21h AH:AL function
+			// selectors and the low words of 32-bit constants.  ADD: any general
+			// register — a large immediate added to a register is base-plus-index
+			// address math (the &g[i] idiom), and the real sites use all of them.
 			if (opIndex != 1) {
 				return 0;
 			}
 			Object[] dest = instr.getOpObjects(0);
-			if (dest.length != 1 || !(dest[0] instanceof Register reg) ||
-				!isAddressRegister(reg)) {
+			if (dest.length != 1 || !(dest[0] instanceof Register reg)) {
+				return 0;
+			}
+			boolean allowed = mnemonic.equals("ADD")
+				? isGeneralRegister(reg)
+				: isAddressRegister(reg);
+			if (!allowed) {
 				return 0;
 			}
 		}
@@ -294,6 +315,13 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 	private static boolean isAddressRegister(Register reg) {
 		String name = reg.getName();
 		return name.equals("BX") || name.equals("SI") || name.equals("DI");
+	}
+
+	/** Any 16-bit general register an {@code ADD reg,imm16} may compute into (not SP/BP). */
+	private static boolean isGeneralRegister(Register reg) {
+		String name = reg.getName();
+		return name.equals("AX") || name.equals("BX") || name.equals("CX") ||
+			name.equals("DX") || name.equals("SI") || name.equals("DI");
 	}
 
 	/**
