@@ -36,6 +36,7 @@ public class RTLinkOverlayPage {
 	private final RTLinkPageHeader header;
 	private final List<RTLinkRelocation> relocations;
 	private final List<RTLinkRelocation> secondRelocations;
+	private final List<RTLinkRelocation> thirdRelocations;
 
 	/**
 	 * Constructs an overlay page by reading the header and relocations at the given
@@ -54,21 +55,26 @@ public class RTLinkOverlayPage {
 		reader.setPointerIndex(fileOffset);
 		header = new RTLinkPageHeader(reader);
 
-		relocations = new ArrayList<>();
-		for (int i = 0; i < header.getRelocCount(); i++) {
-			relocations.add(new RTLinkRelocation(reader));
-		}
+		relocations = readList(reader, header.getRelocOffset(), header.getRelocCount());
 
-		// The second list, when the page has one, sits at the next paragraph boundary
-		// after the first. Parsed for visibility but never applied — see
-		// RTLinkPageHeader's class comment for why.
-		secondRelocations = new ArrayList<>();
-		if (header.getSecondRelocCount() > 0) {
-			reader.setPointerIndex(fileOffset + header.getSecondRelocOffset());
-			for (int i = 0; i < header.getSecondRelocCount(); i++) {
-				secondRelocations.add(new RTLinkRelocation(reader));
+		// The second and third lists are parsed for visibility but never applied — they
+		// do not take the image-base delta. See RTLinkPageHeader's class comment.
+		secondRelocations =
+			readList(reader, header.getSecondRelocOffset(), header.getSecondRelocCount());
+		thirdRelocations =
+			readList(reader, header.getThirdRelocOffset(), header.getThirdRelocCount());
+	}
+
+	private List<RTLinkRelocation> readList(BinaryReader reader, int offset, int count)
+			throws IOException {
+		List<RTLinkRelocation> list = new ArrayList<>(count);
+		if (count > 0) {
+			reader.setPointerIndex(fileOffset + offset);
+			for (int i = 0; i < count; i++) {
+				list.add(new RTLinkRelocation(reader));
 			}
 		}
+		return list;
 	}
 
 	public int getPageIndex() {
@@ -89,13 +95,22 @@ public class RTLinkOverlayPage {
 
 	/**
 	 * The page's second relocation list, empty when it has none (as it always is in
-	 * VICEROY.EXE). These are parsed but <b>not</b> applied — see
-	 * {@link RTLinkPageHeader} for why — and are excluded from
-	 * {@link #getModuleBases()} for the same reason: their seg_index has not been shown
-	 * to carry the same module-base meaning as the first list's.
+	 * VICEROY.EXE). These are parsed but <b>not</b> applied — see {@link RTLinkPageHeader}
+	 * for why — and are excluded from {@link #getModuleBases()} for the same reason: their
+	 * seg_index has not been shown to carry the same module-base meaning as the first
+	 * list's.
 	 */
 	public List<RTLinkRelocation> getSecondRelocations() {
 		return secondRelocations;
+	}
+
+	/**
+	 * The page's third relocation list. Empty on every page of every binary seen so far;
+	 * the RTLink runtime reads its count, but no observed executable uses it. Parsed but
+	 * not applied, exactly like {@link #getSecondRelocations()}.
+	 */
+	public List<RTLinkRelocation> getThirdRelocations() {
+		return thirdRelocations;
 	}
 
 	/**
