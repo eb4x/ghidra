@@ -37,7 +37,7 @@ import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
 
 /**
- * Tells the decompiler where the RTLink/Plus resident switch tables really go.
+ * Tells the decompiler where the RTLink/Plus switch tables — resident and overlay — really go.
  * <p>
  * {@link RTLinkSwitchTableAnalyzer} repairs the <i>references</i>, which is what keeps the listing
  * and function bodies sane. It cannot repair the decompiler, whose own p-code still resolves
