@@ -35,6 +35,7 @@ public class RTLinkOverlayPage {
 	private final long fileOffset;
 	private final RTLinkPageHeader header;
 	private final List<RTLinkRelocation> relocations;
+	private final List<RTLinkRelocation> secondRelocations;
 
 	/**
 	 * Constructs an overlay page by reading the header and relocations at the given
@@ -54,8 +55,19 @@ public class RTLinkOverlayPage {
 		header = new RTLinkPageHeader(reader);
 
 		relocations = new ArrayList<>();
-		for (long i = 0; i < header.getRelocCount(); i++) {
+		for (int i = 0; i < header.getRelocCount(); i++) {
 			relocations.add(new RTLinkRelocation(reader));
+		}
+
+		// The second list, when the page has one, sits at the next paragraph boundary
+		// after the first. Parsed for visibility but never applied — see
+		// RTLinkPageHeader's class comment for why.
+		secondRelocations = new ArrayList<>();
+		if (header.getSecondRelocCount() > 0) {
+			reader.setPointerIndex(fileOffset + header.getSecondRelocOffset());
+			for (int i = 0; i < header.getSecondRelocCount(); i++) {
+				secondRelocations.add(new RTLinkRelocation(reader));
+			}
 		}
 	}
 
@@ -73,6 +85,17 @@ public class RTLinkOverlayPage {
 
 	public List<RTLinkRelocation> getRelocations() {
 		return relocations;
+	}
+
+	/**
+	 * The page's second relocation list, empty when it has none (as it always is in
+	 * VICEROY.EXE). These are parsed but <b>not</b> applied — see
+	 * {@link RTLinkPageHeader} for why — and are excluded from
+	 * {@link #getModuleBases()} for the same reason: their seg_index has not been shown
+	 * to carry the same module-base meaning as the first list's.
+	 */
+	public List<RTLinkRelocation> getSecondRelocations() {
+		return secondRelocations;
 	}
 
 	/**
