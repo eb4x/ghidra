@@ -688,9 +688,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		applyRelocationList(program, memory, blockStart, page.getSecondRelocations(),
 			frameDelta, pageDisplay, log);
 
-		// List 3 is still not applied: nothing in the corpus has one (reloc_count_3 is 0
-		// on every page of every binary seen), so there is no way to check an answer, and
-		// the runtime gives it a different base segment again.
+		// List 3 is not applied, and that is final rather than provisional: beyond being
+		// empty on every page of every binary seen, the RTLink/Plus 6.10 linker has been
+		// shown by construction to be incapable of emitting one (its resident-site patch
+		// path announces itself and then writes nothing — see RTLinkPageHeader's class
+		// comment and ~/dosbox/RTLTEST/HANDOFF.md). A nonzero count would mean a
+		// different linker version, and its sites would live in the resident image, not
+		// this block, with yet another base segment.
 	}
 
 	/**

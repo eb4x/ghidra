@@ -73,7 +73,13 @@ import ghidra.util.exception.DuplicateNameException;
  * a <i>difference</i> against a runtime structure rather than the load delta. Nothing is
  * added to those sites at image-base time, so leaving them alone is what a static image
  * should do. {@code reloc_count_3} is zero on all 281 pages across VICEROY, NEBULAR and
- * ROE2MAIN, so the third list has never actually been observed in the wild.
+ * ROE2MAIN — and it has since been established <b>by construction</b> (RTLink/Plus 6.10 +
+ * a purpose-built probe; see {@code ~/dosbox/RTLTEST/HANDOFF.md}) that the 6.10 linker
+ * cannot emit a list-3 entry at all: for a resident site holding a paged symbol's segment
+ * it announces "page-base relocation will be performed when the page comes in" and then
+ * writes nothing, leaving the site permanently unpatched. The runtime's list-3 support is
+ * vestigial for 6.10-linked programs, so parsing without applying is the complete
+ * treatment, not a stopgap.
  */
 public class RTLinkPageHeader implements StructConverter {
 
