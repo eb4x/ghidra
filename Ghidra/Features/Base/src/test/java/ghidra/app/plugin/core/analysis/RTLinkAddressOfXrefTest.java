@@ -1,0 +1,123 @@
+/* ###
+ * IP: GHIDRA
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package ghidra.app.plugin.core.analysis;
+
+import static org.junit.Assert.*;
+
+import org.junit.Test;
+
+import generic.test.AbstractGenericTest;
+import ghidra.program.database.ProgramBuilder;
+import ghidra.program.model.address.SegmentedAddressSpace;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.listing.ProgramContext;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.RefType;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceManager;
+
+/**
+ * Regression test for {@link RTLinkXrefAnalyzer#addDataXrefs}: the address-of
+ * immediate pass ({@code PUSH imm16} / {@code MOV BX/SI/DI,imm16} whose value
+ * lands in a mapped non-executable block gets a DATA reference) and its guards,
+ * plus the pre-existing DS-relative dereference pass.  The memory map mirrors
+ * VICEROY.EXE's DGROUP: an executable low block (its CODE_104) whose extent
+ * rejects every small coincidental constant, and an uninitialized rw- block
+ * (its BSS DATA) holding the globals.
+ */
+public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
+
+	@Test
+	public void testAddressOfImmediateXrefs() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("AOF", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0000", 0x20);
+			// mirrors CODE_104: the executable low-DGROUP region — targets here rejected
+			MemoryBlock dgLow = builder.createMemory("CODE_DG", "0x2000:0x0000", 0x100);
+			builder.withTransaction(() -> {
+				code.setExecute(true);
+				dgLow.setExecute(true);
+			});
+			// mirrors the BSS DATA block: uninitialized rw- — valid target
+			builder.createUninitializedMemory("DATA", "0x2000:0x1000", 0x100);
+
+			builder.setBytes("0x1000:0x0000",
+			// @formatter:off
+				"68 10 10 " + // 0x0000  PUSH 0x1010     -> BSS: DATA ref, opIndex 0
+				"be 20 10 " + // 0x0003  MOV SI,0x1020   -> BSS: DATA ref, opIndex 1
+				"68 50 00 " + // 0x0006  PUSH 0x50       -> executable block: no ref
+				"68 00 30 " + // 0x0009  PUSH 0x3000     -> unmapped: no ref
+				"b9 10 10 " + // 0x000c  MOV CX,0x1010   -> disallowed register: no ref
+				"b8 10 10 " + // 0x000f  MOV AX,0x1010   -> AX excluded (DOS selectors): no ref
+				"a1 10 10",   // 0x0012  MOV AX,[0x1010] -> deref pass: READ ref
+			// @formatter:on
+				true);
+			builder.setRegisterValue("DS", "0x1000:0x0000", "0x1000:0x001f", 0x2000);
+
+			Program program = builder.getProgram();
+			ProgramContext context = program.getProgramContext();
+			Register ds = context.getRegister("DS");
+			Memory memory = program.getMemory();
+			ReferenceManager refManager = program.getReferenceManager();
+			SegmentedAddressSpace space =
+				(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+
+			RTLinkXrefAnalyzer.Counts counts = new RTLinkXrefAnalyzer.Counts();
+			builder.withTransaction(() -> {
+				for (Instruction instr : program.getListing().getInstructions(true)) {
+					RTLinkXrefAnalyzer.addDataXrefs(instr, context, ds, memory, refManager,
+						space, counts);
+				}
+			});
+
+			assertEquals("address-of refs", 2, counts.addressOf);
+			assertEquals("deref refs", 1, counts.deref);
+
+			Reference[] push = refManager.getReferencesFrom(builder.addr("0x1000:0x0000"));
+			assertEquals(1, push.length);
+			assertEquals(RefType.DATA, push[0].getReferenceType());
+			assertEquals(builder.addr("0x2000:0x1010"), push[0].getToAddress());
+			assertEquals(0, push[0].getOperandIndex());
+
+			Reference[] movSi = refManager.getReferencesFrom(builder.addr("0x1000:0x0003"));
+			assertEquals(1, movSi.length);
+			assertEquals(RefType.DATA, movSi[0].getReferenceType());
+			assertEquals(builder.addr("0x2000:0x1020"), movSi[0].getToAddress());
+			assertEquals(1, movSi[0].getOperandIndex());
+
+			assertEquals("imm into executable block must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0006")).length);
+			assertEquals("imm into unmapped memory must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0009")).length);
+			assertEquals("MOV CX,imm must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x000c")).length);
+			assertEquals("MOV AX,imm must not ref", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x000f")).length);
+
+			Reference[] deref = refManager.getReferencesFrom(builder.addr("0x1000:0x0012"));
+			assertEquals(1, deref.length);
+			assertTrue("deref pass must still make READ refs",
+				deref[0].getReferenceType().isRead());
+			assertEquals(builder.addr("0x2000:0x1010"), deref[0].getToAddress());
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+}

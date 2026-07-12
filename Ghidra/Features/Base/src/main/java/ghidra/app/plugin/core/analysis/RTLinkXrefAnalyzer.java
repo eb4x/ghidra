@@ -44,12 +44,24 @@ import ghidra.util.task.TaskMonitor;
  * {@code assumeDataSegmentRegister}), so the target {@code DGROUP:offset} is fully
  * known, and {@link Instruction#getOperandRefType(int)} distinguishes READ from
  * WRITE from the operand p-code.</li>
+ * <li><b>Address-of immediates</b> &mdash; {@code PUSH imm16} and
+ * {@code MOV BX/SI/DI,imm16} whose immediate, resolved against the same assumed
+ * DS, lands in a mapped non-executable block get {@link RefType#DATA} references.
+ * Globals only ever passed by address ({@code fread(&g_players, ...)} compiles to
+ * {@code PUSH 0x540e}) otherwise show zero xrefs.  The block guard is the
+ * false-positive bound: every small coincidental constant falls below the data
+ * block's start offset.  Stock analysis never makes these &mdash;
+ * {@code ConstantPropagationAnalyzer} disables param-constant refs on segmented
+ * address spaces and resolves bare constants as segment-0 addresses.</li>
  * </ul>
- * Scope of the data pass: DS-relative memory reads/writes into DGROUP only.
- * Address-of immediates ({@code PUSH 0x540e}), segment-overridden
- * ({@code ES:}/{@code SS:}/{@code CS:}) accesses, and fully-computed operands with
- * no displacement ({@code [BX+SI]}) are deliberately not materialised &mdash; those
- * remain a heuristic/on-demand concern.
+ * Still out of scope: immediates of arithmetic/comparison instructions (only the
+ * PUSH and MOV-into-address-register shapes are considered), {@code MOV AX,imm16}
+ * (measured ~90% false positives: DOS int 21h AH:AL function selectors such as
+ * {@code 0x3D00}/{@code 0x4200} and low words of 32-bit constants land in the data
+ * extent), segment-overridden ({@code ES:}/{@code SS:}/{@code CS:}) accesses,
+ * fully-computed operands with no displacement ({@code [BX+SI]}), and targets in
+ * executable blocks (the initialized low-DGROUP region; stock constant
+ * propagation covers those).
  */
 public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 
@@ -57,7 +69,8 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 	private static final String DESCRIPTION =
 		"Creates the cross-references the stock operand analyzer skips in 16-bit " +
 			"address spaces: far call/jump xrefs from overlay code to main program " +
-			"routines, and DS-relative data read/write xrefs (DGROUP globals).";
+			"routines, DS-relative data read/write xrefs (DGROUP globals), and " +
+			"address-of immediate xrefs (PUSH/MOV of a DGROUP data offset).";
 
 	public RTLinkXrefAnalyzer() {
 		super(NAME, DESCRIPTION, AnalyzerType.INSTRUCTION_ANALYZER);
@@ -92,7 +105,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 
 		int overlayCount = 0;
-		int dataCount = 0;
+		Counts counts = new Counts();
 
 		InstructionIterator instrIter = listing.getInstructions(set, true);
 		while (instrIter.hasNext()) {
@@ -103,7 +116,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 				overlayCount += addOverlayFarXref(instr, memory, refManager, space);
 			}
 			if (doDataXrefs) {
-				dataCount += addDataXrefs(instr, context, ds, memory, refManager, space);
+				addDataXrefs(instr, context, ds, memory, refManager, space, counts);
 			}
 		}
 
@@ -111,8 +124,12 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 			Msg.info(this,
 				"RTLink/Plus: Created " + overlayCount + " overlay far call/jump xrefs");
 		}
-		if (dataCount > 0) {
-			Msg.info(this, "RTLink/Plus: Created " + dataCount + " DS-relative data xrefs");
+		if (counts.deref > 0) {
+			Msg.info(this, "RTLink/Plus: Created " + counts.deref + " DS-relative data xrefs");
+		}
+		if (counts.addressOf > 0) {
+			Msg.info(this,
+				"RTLink/Plus: Created " + counts.addressOf + " address-of immediate xrefs");
 		}
 		return true;
 	}
@@ -161,27 +178,37 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		return 0;
 	}
 
+	/** Per-run counters for the data pass, reported separately in {@link #added}. */
+	static final class Counts {
+		int deref; // DS-relative memory-operand READ/WRITE refs
+		int addressOf; // address-of immediate DATA refs
+	}
+
 	/**
 	 * Data pass: create READ/WRITE references for the instruction's DS-relative
-	 * memory operands.  Returns the number of references created.
+	 * memory operands and DATA references for its address-of immediates.
+	 * Package-private, with the counters passed in, so tests can drive it directly.
 	 */
-	private static int addDataXrefs(Instruction instr, ProgramContext context, Register ds,
-			Memory memory, ReferenceManager refManager, SegmentedAddressSpace space) {
+	static void addDataXrefs(Instruction instr, ProgramContext context, Register ds,
+			Memory memory, ReferenceManager refManager, SegmentedAddressSpace space,
+			Counts counts) {
 		// The DS=DGROUP context is set only over executable blocks, so a present
 		// value both confirms we are in code and gives the segment to resolve with.
 		RegisterValue dsVal = context.getRegisterValue(ds, instr.getAddress());
 		if (dsVal == null || !dsVal.hasValue()) {
-			return 0;
+			return;
 		}
 		int dgroup = dsVal.getUnsignedValue().intValue() & 0xffff;
 
-		int count = 0;
 		int numOps = instr.getNumOperands();
 		for (int i = 0; i < numOps; i++) {
-			// DS-relative memory operand only (a register-relative effective
-			// address). Skip pure SCALAR immediates: address-of vs coincidental
-			// constant is heuristic and out of scope.
-			if (!OperandType.isDynamic(instr.getOperandType(i))) {
+			int opType = instr.getOperandType(i);
+			if (!OperandType.isDynamic(opType)) {
+				// Not a memory operand; a pure immediate may still be an address-of.
+				if (OperandType.isScalar(opType)) {
+					counts.addressOf +=
+						addAddressOfXref(instr, i, dgroup, memory, refManager, space);
+				}
 				continue;
 			}
 
@@ -203,19 +230,80 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 			}
 
 			Address target = space.getAddress(dgroup, offset);
-			MemoryBlock tb = memory.getBlock(target);
-			if (tb == null || tb.isExecute()) {
-				// Must land in a mapped data block; DGROUP globals live in BSS, so
-				// uninitialized (rw-) data blocks are valid targets. Skip only
-				// unmapped memory and executable (code) blocks.
+			if (!isMappedDataTarget(target, memory)) {
 				continue;
 			}
 
 			refManager.addMemoryReference(instr.getAddress(), target, rt,
 				SourceType.ANALYSIS, i);
-			count++;
+			counts.deref++;
 		}
-		return count;
+	}
+
+	/**
+	 * Address-of pass: create a DATA reference for a pure imm16 operand of
+	 * {@code PUSH imm16} or {@code MOV BX/SI/DI,imm16} whose value, resolved
+	 * against DS=DGROUP, lands in a mapped non-executable block.  Returns the
+	 * number of references created (0 or 1).
+	 */
+	private static int addAddressOfXref(Instruction instr, int opIndex, int dgroup,
+			Memory memory, ReferenceManager refManager, SegmentedAddressSpace space) {
+		String mnemonic = instr.getMnemonicString();
+		if (mnemonic.equals("PUSH")) {
+			if (opIndex != 0 || instr.getNumOperands() != 1) {
+				return 0;
+			}
+		}
+		else if (mnemonic.equals("MOV")) {
+			// Only moves into a register plausibly used as a pointer.  CX and DX
+			// carry counts and sizes; AX carries DOS int 21h AH:AL function
+			// selectors and the low words of 32-bit constants, which dominate its
+			// in-range immediates.
+			if (opIndex != 1) {
+				return 0;
+			}
+			Object[] dest = instr.getOpObjects(0);
+			if (dest.length != 1 || !(dest[0] instanceof Register reg) ||
+				!isAddressRegister(reg)) {
+				return 0;
+			}
+		}
+		else {
+			return 0;
+		}
+
+		Object[] opObjects = instr.getOpObjects(opIndex);
+		if (opObjects.length != 1 || !(opObjects[0] instanceof Scalar imm)) {
+			return 0;
+		}
+		long value = imm.getUnsignedValue();
+		if (value > 0xffff) {
+			return 0;
+		}
+
+		Address target = space.getAddress(dgroup, (int) value);
+		if (!isMappedDataTarget(target, memory)) {
+			return 0;
+		}
+
+		refManager.addMemoryReference(instr.getAddress(), target, RefType.DATA,
+			SourceType.ANALYSIS, opIndex);
+		return 1;
+	}
+
+	private static boolean isAddressRegister(Register reg) {
+		String name = reg.getName();
+		return name.equals("BX") || name.equals("SI") || name.equals("DI");
+	}
+
+	/**
+	 * True if the target lands in a mapped non-executable block.  DGROUP globals
+	 * live in BSS, so uninitialized (rw-) data blocks are valid targets; only
+	 * unmapped memory and executable (code) blocks are rejected.
+	 */
+	private static boolean isMappedDataTarget(Address target, Memory memory) {
+		MemoryBlock block = memory.getBlock(target);
+		return block != null && !block.isExecute();
 	}
 
 	/** True if the operand carries an explicit non-DS segment register (override prefix). */
