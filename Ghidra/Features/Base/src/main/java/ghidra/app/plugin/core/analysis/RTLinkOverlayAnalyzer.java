@@ -234,7 +234,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				monitor.setMessage("RTLink: Applying overlay relocations...");
 				for (OverlayBlockInfo info : overlayBlocks) {
 					monitor.checkCancelled();
-					applyOverlayRelocations(program, info, log);
+					applyOverlayRelocations(program, info.block(), info.page(), log);
 				}
 			}
 
@@ -651,11 +651,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 	}
 
-	private void applyOverlayRelocations(Program program, OverlayBlockInfo info,
-			MessageLog log) {
+	static void applyOverlayRelocations(Program program, MemoryBlock block,
+			RTLinkOverlayPage page, MessageLog log) {
 		Memory memory = program.getMemory();
-		Address blockStart = info.block().getStart();
-		RTLinkOverlayPage page = info.page();
+		Address blockStart = block.getStart();
 		int pageDisplay = page.getPageIndex() - 1;
 
 		// The runtime fixup loop (210d:2e59 in VICEROY.EXE) addresses each patch
@@ -698,7 +697,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * Add {@code delta} to the unrelocated segment word at each of {@code relocations}'
 	 * sites, and record the fixups in the relocation table.
 	 */
-	private void applyRelocationList(Program program, Memory memory, Address blockStart,
+	private static void applyRelocationList(Program program, Memory memory, Address blockStart,
 			List<RTLinkRelocation> relocations, int delta, int pageDisplay, MessageLog log) {
 		for (RTLinkRelocation reloc : relocations) {
 			int siteOffset = reloc.getSiteOffset();
