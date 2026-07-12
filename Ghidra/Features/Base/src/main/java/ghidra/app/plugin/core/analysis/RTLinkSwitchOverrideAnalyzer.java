@@ -113,10 +113,12 @@ public class RTLinkSwitchOverrideAnalyzer extends AbstractAnalyzer {
 		}
 
 		if (written > 0) {
-			String msg =
-				String.format("RTLink/Plus: Wrote %d switch table override(s)", written);
-			Msg.info(this, msg);
-			log.appendMsg(msg);
+			// Msg.info only, never log.appendMsg: any content in the analysis MessageLog makes
+			// AutoAnalysisPlugin.analysisEnded() pop a "There were warnings/errors issued during
+			// analysis" dialog, so routing a success count there cries wolf on a clean run. The
+			// MessageLog is for things that went wrong (see the failure paths above).
+			Msg.info(this,
+				String.format("RTLink/Plus: Wrote %d switch table override(s)", written));
 		}
 		return true;
 	}
