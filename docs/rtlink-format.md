@@ -567,6 +567,38 @@ the reference this analyzer had just added.
 | **`$$RTOVEXEOFFSET` ≠ 0** | Same root cause: we assume the area starts at the image end |
 | **List 3** | Parsed, never applied. Correct: RTLink 6.10 cannot emit one |
 | **`.RTL` / RTLINKST programs** | No specimen |
+| **`XLAT`-indexed state machines** | Declined on purpose — nothing in the instruction stream bounds the jump table. See below: leave them alone, and mean it |
+
+### The XLAT state machine, and the Sleigh bug behind it
+
+Each binary's C library carries the MSC formatter — an `XLAT`-driven FSM whose dispatch is a
+CS-relative jump table we deliberately decline (nothing bounds it):
+
+```
+1417:0d92  MOV BX,0x4f36        ; class table — a DGROUP offset
+1417:0d9b  XLAT                 ; AL = DS:[BX+AL]
+   ...                          ; second XLAT selects the next state
+1417:0db7  JMP word ptr CS:[BX + 0xd54]
+```
+
+It is the source of the one benign warning each binary leaves in the log —
+`Unable to read bytes at ram:0000:4f36`. **That warning is a stock-Ghidra bug, and it is
+load-bearing.** `XLAT` is the only memory access in the whole x86 spec that ignores its
+segment: `ia.sinc` gives the 16-bit form `ptr2(tmp, BX+zext(AL))`, a flat zero-extension,
+where every other 16-bit operand (`Mem16`, `moffs`, the string ops) goes through
+`segment(seg16, offset)` — which the real-mode pspec maps via `<segmentop>`. The constructor
+even parses and prints the segment (`XLAT CS:BX` and `XLAT SS:BX` both occur in SPHERE) and
+then throws it away. In real mode the translate table is therefore read from physical
+`0000:offset` — the interrupt vector table.
+
+**Fixing it makes the analysis worse, which is why the spec is untouched.** Correcting the
+semantics to `segment(seg16, BX+zext(AL))` was tried and reverted: the decompiler then reads
+the class table correctly (DS resolves to DGROUP, as it should) and goes on to resolve the FSM
+jump table it could not reach before — unboundedly, and wrongly. It emits `halt_baddata` cases,
+plants bad flows, and the ERROR bookmarks rise (ROE2MAIN 4 → 6, SPHERE 5 → 6). The unreadable
+table is what currently *stops* the decompiler at the exact place we want it stopped. Taking
+the fix would mean also taking the FSM dispatch away from `DecompilerSwitchAnalyzer` — that is,
+bounding the table ourselves, which needs the state table interpreted, not just read.
 
 <a name="corpus"></a>
 ## Corpus
