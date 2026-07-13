@@ -17,13 +17,17 @@ package ghidra.app.plugin.core.analysis;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressOutOfBoundsException;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.reloc.Relocation.Status;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
@@ -296,12 +300,51 @@ class EmulatedFloatPatcher {
 				new long[] { vector, Byte.toUnsignedInt(opcode) }, original,
 				String.format("EMULATED_FP_INT_%02X", vector));
 
-			new DisassembleCommand(addr, null, true).applyTo(program, monitor);
+			new DisassembleCommand(restartPoints(program, addr, last), null, true)
+					.applyTo(program, monitor);
 			return true;
 		}
 		catch (MemoryAccessException | AddressOutOfBoundsException e) {
 			return false;
 		}
+	}
+
+	/**
+	 * Where to disassemble from after the rewrite: the patched instruction, plus anything
+	 * inside the cleared window that is the destination of a flow reference.
+	 * <p>
+	 * Flow from the patch point regenerates the straight-line code after it, but only that.
+	 * A jump target inside the window is reached from somewhere else — clearing it and then
+	 * disassembling by flow alone would leave it as raw bytes. That is not hypothetical:
+	 * the {@code JMP word ptr [DI]} at {@code 122e:5280} in ROE2MAIN.EXE has a case at
+	 * {@code 122e:528a}, which sits within the window of the emulator call two bytes into
+	 * the case before it. Recovering that switch (see {@code RTLinkSwitchTableAnalyzer}) is
+	 * what makes the case reachable in the first place, and the reference it adds is what
+	 * this finds it by.
+	 * <p>
+	 * Only <em>flow</em> destinations are restarted, never every address that used to hold
+	 * an instruction: the mis-decoded run this clears is out of phase, so its old
+	 * instruction starts are exactly the wrong boundaries to disassemble from again.
+	 */
+	private static AddressSet restartPoints(Program program, Address addr, Address last) {
+		AddressSet starts = new AddressSet(addr, addr);
+		Address afterPatch = addr.next();
+		if (afterPatch == null || afterPatch.compareTo(last) > 0) {
+			return starts;
+		}
+		ReferenceManager references = program.getReferenceManager();
+		AddressIterator cleared = references
+				.getReferenceDestinationIterator(new AddressSet(afterPatch, last), true);
+		while (cleared.hasNext()) {
+			Address destination = cleared.next();
+			for (Reference reference : references.getReferencesTo(destination)) {
+				if (reference.getReferenceType().isFlow()) {
+					starts.add(destination);
+					break;
+				}
+			}
+		}
+		return starts;
 	}
 
 	/**

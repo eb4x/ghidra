@@ -463,7 +463,7 @@ and not one). All live in
 | Analyzer | Type / priority | Does |
 |---|---|---|
 | `RTLinkOverlayAnalyzer` | BYTE, `FORMAT_ANALYSIS.after()` | Detects the overlay area, parses records, creates the overlay blocks, applies relocations, discovers dispatchers, resolves stubs and trampolines into thunks, disassembles overlay code, assumes DS=DGROUP |
-| `RTLinkSwitchTableAnalyzer` | INSTRUCTION, `CODE_ANALYSIS.before()` | Recovers CS-/module-relative switch tables and their *references*. Must beat `DecompilerSwitchAnalyzer`, which skips computed branches that already have computed refs — winning that race is what keeps bogus targets out of other segments |
+| `RTLinkSwitchTableAnalyzer` | INSTRUCTION, `CODE_ANALYSIS.before()` | Recovers CS-/module-relative switch tables **and DS-relative ones** (see below), and their *references*. Must beat `DecompilerSwitchAnalyzer`, which skips computed branches that already have computed refs — winning that race is what keeps bogus targets out of other segments |
 | `RTLinkSwitchOverrideAnalyzer` | INSTRUCTION, `FUNCTION_ANALYSIS.after()` | Writes decompiler jump-table overrides for those tables (shares `recoverTable()`). Cannot merge with the above: override symbols need a defined `FunctionDB` to hang a namespace off, which does not exist that early |
 | `RTLinkXrefAnalyzer` | INSTRUCTION, `REFERENCE_ANALYSIS.after()` | The DS-relative data references, overlay far call/jump xrefs, and address-of immediates that Ghidra's own passes decline to make on 16-bit segmented programs |
 
@@ -497,6 +497,55 @@ Tests: `RTLinkPageHeaderTest` (header shapes incl. VMEX2's CODEVIEW word),
 `RTLinkOverlayRelocationTest` (pins both deltas hermetically — commit `82f65916ff`),
 `RTLinkAddressOfXrefTest`.
 
+### The DS-relative jump table
+
+Not an RTLink construct at all — a compiler one — but it has to be recovered here for the
+same reason the CS-relative tables do: whatever we leave unresolved, `DecompilerSwitchAnalyzer`
+resolves *wrongly*. The table lives in **DGROUP data**, not after the code, and is reached
+through a pointer rather than a `CS:` displacement (ROE2MAIN.EXE `122e:5280`):
+
+```
+MOV DI,0xb26a          ; table base — a DS offset
+XOR CX,CX
+MOV CL,[BX + SI + 5]   ; index, straight out of a struct field — already scaled
+ADD DI,CX
+JMP word ptr [DI]      ; FF /4, mod=00
+```
+
+Nothing bounds it: there is no `CMP` guard, because the index is a byte the program trusts.
+So the entries themselves have to say where the table ends — read words until one is not a
+plausible case target — and "plausible" has to be sharp, because ROE2MAIN's four entries
+(`52ae, 5282, 528a, 52a3`) are followed immediately by unrelated variables whose first word,
+`0x0078`, *is* a valid instruction address in the same block, just inside a different
+function. Two bounds that look right and are not:
+
+- **The function's body** — the case targets are reachable only *through* the table, so they
+  are precisely what a flow-derived body leaves out. Bounding by it asks the switch to be
+  resolved before it can be resolved.
+- **The `FunctionManager` at all** — `FunctionAnalyzer` ("Create Function") sits at the *same*
+  `CODE_ANALYSIS.before()` priority as this analyzer, and equal priorities run
+  first-queued-first, so whether the dispatching function exists when we look is not ours to
+  decide. In ROE2MAIN it does not.
+
+What does exist by then is the disassembler's own **call references**, and a function begins
+where something calls it — which is what `FunctionAnalyzer` keys on too. So the range runs
+from the nearest call target at or below the dispatch to the nearest one above it, and a
+target outside that range ends the table. `0x0078` is outside; the four real entries are not.
+
+Recovering this one dispatch is worth a paragraph because of what it cost while unresolved:
+`DecompilerSwitchAnalyzer` "resolved" it into **134 targets across five segments**, which is
+where ROE2MAIN's ~60 `DecompileCallback` p-code errors came from (flows into `0000:`,
+`9000:`, `f000:`) and most of its analysis time. Recovering it takes **Decompiler Switch
+Analysis from 118.6 s to 4.7 s** (total analysis 162 s → 35 s), removes the p-code errors
+entirely, and takes the ERROR bookmarks from 19 to 4.
+
+One knock-on, worth knowing because it is the kind of ordering bug that hides: the case at
+`122e:528a` sits inside the *clear window* of an emulated-float call two bytes into the case
+before it. `EmulatedFloatPatcher` clears that window and re-disassembles **by flow**, which
+never reaches a jump target — so the case came back as raw `CD 35` bytes. It now restarts
+disassembly at every flow-reference destination inside the window as well, which is exactly
+the reference this analyzer had just added.
+
 <a name="what-the-analyzers-do-not-support"></a>
 ### What the analyzers do not support
 
@@ -518,7 +567,7 @@ Games (measured with the current analyzers, fresh imports):
 | VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
 | NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
 | SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
-| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 19 |
+| ROE2MAIN.EXE | 171 | 1997 | 136 | 58 | 54 | 4 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
 (All measured from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see
@@ -531,7 +580,8 @@ property of the compiler, not of RTLink**: ROE2MAIN doubles the switch index wit
 `ADD AX,AX` where the other four games use `SHL AX,1`, and it uses `SHL` at *none* of its 60
 table dispatches — so before the matcher accepted both forms, it recovered **zero** tables,
 and Ghidra's own switch analyzer filled the vacuum by reading a *string table* as a jump
-table and chasing ASCII pairs (`"AN"`, `"AR"`, `"BO"`) into unmapped segment `4000`. Its five
+table and chasing ASCII pairs (`"AN"`, `"AR"`, `"BO"`) into unmapped segment `4000`. It is
+also the only binary in the corpus with a **DS-relative** jump table (above). Its five
 remaining unrecovered dispatches are `XLAT`-indexed state machines, which we decline on
 purpose: nothing in the instruction stream bounds the table, so the entry count would be a
 guess.
@@ -545,8 +595,9 @@ encoding is exactly two bytes. Ghidra's real-mode Sleigh reads `CD 3n` as a plai
 calls derailed the instruction stream. `EmulatedFloatAnalyzer` (new) performs the same
 rewrite the runtime does, and its float code now reads as x87 — `WAIT; FSTP ST0; FSTSW AX;
 SAHF; JNZ`, the compare idiom, previously garbage. That is what took ROE2MAIN's ERROR
-bookmarks from 74 to 19. It is gated on emulator-call density, so the four games (1–8 stray
-`CD 3n` byte pairs each, all coincidence) are untouched.
+bookmarks from 74 to 19 (and the DS-relative switch above took them from 19 to 4). It is
+gated on emulator-call density, so the four games (1–8 stray `CD 3n` byte pairs each, all
+coincidence) are untouched.
 
 Three interrupts carry more than the `ESC n` in their number:
 
