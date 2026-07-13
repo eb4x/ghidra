@@ -95,10 +95,19 @@ public class RTLinkOverlayPage {
 
 	/**
 	 * The page's second relocation list, empty when it has none (as it always is in
-	 * VICEROY.EXE). These are parsed but <b>not</b> applied — see {@link RTLinkPageHeader}
-	 * for why — and are excluded from {@link #getModuleBases()} for the same reason: their
-	 * seg_index has not been shown to carry the same module-base meaning as the first
-	 * list's.
+	 * VICEROY.EXE; NEBULAR.EXE has 90 sites, SPHERE.EXE 67). Each site is the segment
+	 * word of a statically encoded <b>intra-page far call</b> between two of the page's
+	 * modules ({@code CALLF module:offset}); the stored word is a page-relative
+	 * paragraph. The runtime fixup (byte-identical in all three binaries; the list-2
+	 * call reads the count from header +0xA, rounds the start index up to a 4-entry
+	 * group exactly as {@link RTLinkPageHeader#getSecondRelocOffset()} models, and adds
+	 * {@code currentFrame - previousFrame} on every page move) maintains the invariant
+	 * <i>word = file word + current frame</i> — so
+	 * {@code RTLinkOverlayAnalyzer.applyOverlayRelocations} applies them statically with
+	 * the overlay block's base segment as the frame. They are excluded from
+	 * {@link #getModuleBases()} only because nothing has needed their seg_index anchors
+	 * yet; the runtime addresses their sites (frame + seg_index):offset identically to
+	 * the first list's.
 	 */
 	public List<RTLinkRelocation> getSecondRelocations() {
 		return secondRelocations;
