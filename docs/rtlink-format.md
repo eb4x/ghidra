@@ -518,7 +518,7 @@ Games (measured with the current analyzers, fresh imports):
 | VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
 | NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
 | SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
-| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 20 |
+| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 19 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
 (All measured from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see
@@ -545,8 +545,25 @@ encoding is exactly two bytes. Ghidra's real-mode Sleigh reads `CD 3n` as a plai
 calls derailed the instruction stream. `EmulatedFloatAnalyzer` (new) performs the same
 rewrite the runtime does, and its float code now reads as x87 — `WAIT; FSTP ST0; FSTSW AX;
 SAHF; JNZ`, the compare idiom, previously garbage. That is what took ROE2MAIN's ERROR
-bookmarks from 74 to 20. It is gated on emulator-call density, so the four games (1–8 stray
-`CD 3n` byte pairs each, all coincidence) are untouched. Two lessons are baked into it: the
+bookmarks from 74 to 19. It is gated on emulator-call density, so the four games (1–8 stray
+`CD 3n` byte pairs each, all coincidence) are untouched.
+
+Three interrupts carry more than the `ESC n` in their number:
+
+| call | is | patch |
+|---|---|---|
+| `INT 34h`–`INT 3Bh` | `ESC 0`–`ESC 7` (`D8`–`DF`), modrm follows | `9B D8+n` |
+| `INT 3Ch` | an ESC with a **segment override**; bit 7 of the next byte picks it — set (`D8`–`DF`) = `ES:`, clear (`58`–`5F`) = `SS:` and the ESC is that byte with bit 7 restored | `9B 26` / `9B 36` (+ restore the opcode) |
+| `INT 3Dh` | `FWAIT` — no operand bytes | `9B 90` |
+
+Neither segment form is a guess. Every `ES:` site is preceded by `LES SI,[BP+8]` or
+`MOV ES,[..]` — a far pointer being dereferenced. Every one of the 154 `SS:` sites has modrm
+`rm=7`, i.e. **`[BX]`**, preceded by `SUB SP,8; MOV BX,SP` — and `[BX]` defaults to `DS`, so
+addressing that stack temp *requires* `SS:`. Restored they read `FLD/FST/FSTP qword ptr
+SS:[BX]`: a double being passed by value. Only `INT 3Eh` (2 sites) is still unknown, and is
+left as an `INT`.
+
+Two lessons are baked into it: the
 rewrite must be driven by the *disassembler*, never a byte scan (a byte scan destroyed the
 dispatch stub whose `JMPF` offset is `0x34CD`), and the clear before re-disassembly must
 reach *past* the call, because the mis-decode leaves the following instructions out of
