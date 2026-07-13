@@ -515,9 +515,9 @@ Games (measured with the current analyzers, fresh imports):
 
 | Binary | records | stubs | trampolines | switch tables | list-2 sites | ERROR bookmarks |
 |---|---|---|---|---|---|---|
-| VICEROY.EXE | 31 | 658 | 370 | 38 | 0 | 1 |
+| VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
 | NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
-| SPHERE.EXE | 105 | 869 | 64 | 123 | 67 | 5 |
+| SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
 | ROE2MAIN.EXE | 171 | not imported | | | 54 | |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
@@ -534,7 +534,7 @@ source and link scripts, and are the best regression material we have):
 
 | Binary | link script demonstrates | records | stubs | tramp. | notes |
 |---|---|---|---|---|---|
-| VMEX1.EXE | `VML` (virtualize everything automatically) | 5 | 8 | 17 | record 0 has code, 8 callers |
+| VMEX1.EXE | `VML` (virtualize everything automatically) | 5 | 9 | 17 | record 0 has code; one straddling stub |
 | VMEX2.EXE | + `AUTOLOCAL`, `LOCSYM`, **`CODEVIEW`** | 5 | 9 | 17 | `codeview_word = 0x091C` on every page |
 | VMEX3.EXE | `VMBEGINPAGES` + `SEPARATE` (partial virtualization) | 4 | 7 | 17 | cleanest specimen |
 | VMEX4.EXE | pages **and** sections, explicit `SECTION`s | (5) | — | — | mixed: page chain not at image end ⇒ declined |
@@ -549,12 +549,26 @@ nonsense counts (14515 list-2 entries, 22096 list-3). `RTLinkPageHeader.isValid(
 it, so XANTH imports as a plain MZ with no overlay blocks and no damage — as do OVTEST1–3
 and the two mixed VMEX binaries. Verified by import, not assumed.
 
-**Known issue found while importing (not yet fixed):** in VMEX1, the first stub of the table
-sits at a flat address that is also reachable as an offset inside the *previous* segment
-(`17fe:0fd0` == `18fb:0000`), and the disassembler claims it by fallthrough in the wrong
-segment frame before the stub scanner gets there — so that one stub is not thunked and its
-`JMPF 0000:017e` leaves an ERROR bookmark. Cosmetic on a 42 KB example; it would matter on a
-binary whose stub table is entered that way.
+### Stubs may straddle a block boundary
+
+Importing VMEX1 turned up a real bug, since fixed. **A stub or trampoline can begin in one
+MZ segment block and end in the next.** VMEX1's jump table starts at flat `0x18fb0`, but the
+preceding segment block (`17fe:0000`–`17fe:0fd1`) runs two bytes *into* it — so the first
+stub's `CALLF` lives in one block and its `JMPF` and page_id in the next.
+
+The scans iterate blocks, and each one range-checked its candidate against **the block it
+happened to be iterating**, so a straddling stub failed `block.contains(callfAddr)` and was
+dropped without a word. Range-checking against *memory* instead (`isCodeMemory`) fixes all
+seven scan guards at once. This was not cosmetic and not VMEX-only:
+
+| | before | after |
+|---|---|---|
+| VMEX1 stubs | 8 (+1 ERROR bookmark) | **9**, no ERROR |
+| VICEROY trampolines | 370 | **371** (one at `2b1f:000a`, crossing its block end by 4 bytes) |
+| SPHERE trampolines | 64 | **65** |
+
+Stub counts and ERROR bookmarks in the games are otherwise unchanged, so the extra
+trampolines are recovered code, not false positives.
 
 ## Prior art
 

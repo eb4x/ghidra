@@ -340,6 +340,23 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
+	 * True if {@code addr} lies in resident code memory — an initialized, executable,
+	 * non-overlay block.
+	 * <p>
+	 * The scans below iterate blocks but must range-check against <em>memory</em>, not
+	 * against the block they happen to be iterating: MZ segment blocks are contiguous in
+	 * flat space, and a stub can straddle the boundary between two of them. VMEX1.EXE has
+	 * one — its jump table's first stub begins two bytes before the end of the preceding
+	 * segment block — and a per-block check silently dropped it, leaving the stub
+	 * unresolved and its {@code JMPF 0000:xxxx} to be walked into unmapped memory.
+	 */
+	private static boolean isCodeMemory(Memory memory, Address addr) {
+		MemoryBlock block = memory.getBlock(addr);
+		return block != null && !block.isOverlay() && block.isExecute() &&
+			block.isInitialized();
+	}
+
+	/**
 	 * Index {@code overlayBlocks} by overlay record index (= page index). Stub scans
 	 * look pages up by record index rather than list position, so a record skipped for
 	 * having no code cannot shift every later page onto the wrong block.
@@ -946,7 +963,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 				try {
 					Address jmpfAddr = searchAddr.add(5);
-					if (block.contains(jmpfAddr) &&
+					if (isCodeMemory(memory, jmpfAddr) &&
 						memory.getByte(jmpfAddr) == OPCODE_JMPF) {
 						int off = Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
 						int seg = Short.toUnsignedInt(memory.getShort(searchAddr.add(3)));
@@ -1088,8 +1105,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					Address callfAddr = searchAddr.subtract(5);
 					Address pageIdAddr = searchAddr.add(5);
 
-					if (!block.contains(callfAddr) ||
-						!block.contains(pageIdAddr.add(1))) {
+					if (!isCodeMemory(memory, callfAddr) ||
+						!isCodeMemory(memory, pageIdAddr.add(1))) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
@@ -1136,9 +1153,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					int stubSize = 12;
 					int moduleBase = 0;
 					Address moduleWordAddr = callfAddr.add(12);
-					if (block.contains(moduleWordAddr.add(1)) &&
-						!isDispatcherCallf(memory, space, block, dispatchers,
-							moduleWordAddr)) {
+					if (isCodeMemory(memory, moduleWordAddr.add(1)) &&
+						!isDispatcherCallf(memory, space, dispatchers, moduleWordAddr)) {
 						int word = Short.toUnsignedInt(memory.getShort(moduleWordAddr));
 						if (word < target.page().getHeader().getTotalParagraphs()) {
 							stubSize = 14;
@@ -1200,9 +1216,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * discovered overlay dispatchers — i.e. the start of another dispatch stub.
 	 */
 	private static boolean isDispatcherCallf(Memory memory, SegmentedAddressSpace space,
-			MemoryBlock block, Set<Long> dispatchers, Address addr) {
+			Set<Long> dispatchers, Address addr) {
 		try {
-			if (!block.contains(addr) || !block.contains(addr.add(4))) {
+			if (!isCodeMemory(memory, addr) || !isCodeMemory(memory, addr.add(4))) {
 				return false;
 			}
 			if (memory.getByte(addr) != OPCODE_CALLF) {
@@ -1270,7 +1286,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 				try {
 					Address callfAddr = searchAddr.subtract(5);
-					if (!block.contains(callfAddr) || !block.contains(searchAddr.add(4))) {
+					if (!isCodeMemory(memory, callfAddr) ||
+						!isCodeMemory(memory, searchAddr.add(4))) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
@@ -1284,7 +1301,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						continue;
 					}
 
-					if (!isDispatcherCallf(memory, space, block, dispatchers, callfAddr)) {
+					if (!isDispatcherCallf(memory, space, dispatchers, callfAddr)) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
@@ -1430,7 +1447,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					Address idAddr = searchAddr.add(2);
 					Address offAddr = searchAddr.add(4);
 
-					if (!block.contains(offAddr.add(1))) {
+					if (!isCodeMemory(memory, offAddr.add(1))) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
