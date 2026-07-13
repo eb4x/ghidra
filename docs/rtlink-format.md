@@ -557,6 +557,47 @@ never reaches a jump target — so the case came back as raw `CD 35` bytes. It n
 disassembly at every flow-reference destination inside the window as well, which is exactly
 the reference this analyzer had just added.
 
+### Buried code, and why nothing may be left undisassembled
+
+Code that no pass ever disassembles is invisible: it is not wrong, it is *absent*, and
+nothing in the listing says so. Three mechanisms produced it in this corpus, and
+`RTLinkFlowRepairAnalyzer` (BYTE, `LOW_PRIORITY.after()` — dead last, once every flow has
+been planted and every conflict bookmarked) exists to make all three impossible.
+
+**A relocated word behind a call.** Each binary's C startup exits through a vector —
+`MOV AX,0xFF; PUSH AX; PUSH CS; CALL word ptr [__exit]` (VICEROY `1d1d:0241`, NEBULAR
+`1417:00fd`, SPHERE `160f:0109`, ROE2MAIN `122e:011c`) — whose callee reaches `INT 21h/4C`
+and never comes back. The bytes at the call's fall-through are an *inline relocated segment
+word*, and the disassembler decodes them as code. The invariant that settles it: **an
+address carrying a loader relocation can never be the first byte of an instruction** — MZ
+relocations patch operand words. So the call cannot return there whatever its callee does;
+the analyzer marks it `CALL_RETURN`, clears the junk, and **seals the word as data** so no
+later pass can decode it again. In NEBULAR that junk was burying a real routine
+(`1417:0104`, called from `1417:00b1`) — 197 bytes of function that simply did not exist.
+
+**Junk winning a conflict.** When a flow target is already covered by junk, the disassembler
+stamps `Failed to disassemble at X due to conflicting instruction` *at the blocked address*
+and moves on — the junk keeps the bytes. The analyzer arbitrates by evidence: the blocked
+address must have a flow reference or a fall-through from evidenced code, and every
+conflicting instruction must have none. Then, and only then, the junk is cleared
+(`ClearFlowAndRepairCmd`, which prunes anything with outside evidence) and the real code
+disassembled. Evidence on *both* sides is declined with a warning — that is not ours to
+decide — and evidence on *neither* side is left strictly alone, which is what keeps the
+analyzer off the unreferenced disassembly islands over zeroed C-library data.
+
+**Routines nothing reaches.** ROE2MAIN's `122e:51a0` is a function whose entry nothing
+references (its siblings are called through pointers), whose bytes were cleared out from
+under the pattern seeders by the emulated-float rewrite, and which flow-based recovery
+therefore never reaches: an undefined 11-byte hole holding `PUSH BP; MOV BP,SP; SUB SP,0x12`
+— byte-for-byte the prologue of its sibling `FUN_122e_5177` — with its epilogue stranded four
+bytes further on (`122e:51be`, `MOV SP,BP; POP BP; RETF`; the disassembler's fossil bookmark
+there names the page-segment alias `1000:749e`, the same flat byte). The analyzer claims such
+a gap only when the bytes account for themselves *exactly* — every instruction decodes and
+the run ends precisely on the boundary of the code that follows, one byte over or under and
+the decode is out of phase — **and** the gap looks like a routine: a frame prologue, a
+stranded epilogue where the next function begins, or a straight fall-through from above. A
+run of one repeated byte is padding by definition and is never claimed.
+
 <a name="what-the-analyzers-do-not-support"></a>
 ### What the analyzers do not support
 
