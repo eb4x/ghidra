@@ -13,9 +13,9 @@ lives in `Ghidra/Features/Base`:
 
 - `src/main/java/ghidra/app/util/bin/format/mz/RTLink{PageHeader,Relocation,OverlayPage}.java` —
   overlay file-format parsing
-- four analyzers in `src/main/java/ghidra/app/plugin/core/analysis/`, each pinned to a
+- five analyzers in `src/main/java/ghidra/app/plugin/core/analysis/`, each pinned to a
   different slot in the auto-analysis pipeline (an analyzer registers exactly one
-  `AnalyzerType` + `AnalysisPriority`, which is why this is four classes and not one):
+  `AnalyzerType` + `AnalysisPriority`, which is why this is five classes and not one):
   - `RTLinkOverlayAnalyzer` — BYTE, `FORMAT_ANALYSIS.after()`. Detects overlay data past
     the MZ image end, parses pages, creates the overlay memory blocks, wires up the
     dispatch-stub thunks and assumes DS=DGROUP. Runs on raw bytes, before disassembly.
@@ -32,8 +32,18 @@ lives in `Ghidra/Features/Base`:
   - `RTLinkXrefAnalyzer` — INSTRUCTION, `REFERENCE_ANALYSIS.after()`. Resolves the
     DS-relative data references that Ghidra's own reference pass declines to make on
     RTLink programs.
+  - `RTLinkFlowRepairAnalyzer` — BYTE, `LOW_PRIORITY.after()` (dead last, once every
+    other pass has planted its flows and the disassembler has stamped its conflict
+    bookmarks). Recovers **buried code** — real, evidenced instructions left
+    undisassembled under junk. Three detectors: a CALL whose fall-through lands on an
+    MZ-relocated segment word cannot return there, so the word is sealed as data and the
+    call marked `CALL_RETURN`; a "conflicting instruction" bookmark is arbitrated by
+    evidence, and unreferenced junk loses to referenced code; and an undefined gap
+    between routines that decodes exactly onto the code after it — a prologue, or a
+    stranded epilogue — is disassembled. Everything unevidenced (padding, zero-run
+    islands) is left strictly alone.
 
-Analyzer housekeeping: all four set `setSupportsOneTimeAnalysis()` so they can be re-run
+Analyzer housekeeping: all five set `setSupportsOneTimeAnalysis()` so they can be re-run
 from Analysis → One Shot on an already-analyzed program. Report success counts with
 `Msg.info`, never `log.appendMsg` — any content in the analysis `MessageLog` makes
 `AutoAnalysisPlugin` pop a "warnings/errors issued during analysis" dialog, so the
