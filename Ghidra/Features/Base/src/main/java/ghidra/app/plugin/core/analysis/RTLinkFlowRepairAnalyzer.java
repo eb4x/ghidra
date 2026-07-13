@@ -778,6 +778,16 @@ public class RTLinkFlowRepairAnalyzer extends AbstractAnalyzer {
 			if (decoded == null) {
 				return false; // does not decode: not code
 			}
+			if (flowsNowhere(program, decoded)) {
+				// A decode that jumps somewhere that does not exist is not code this
+				// analyzer may claim. The shape that matters here is RTLink's own
+				// dispatch stub — CALLF dispatcher; JMPF 0000:offset, whose segment is
+				// deliberately left unrelocated until the overlay manager patches it at
+				// runtime. Those are RTLinkOverlayAnalyzer's to resolve into thunks;
+				// decoding them here produces a real instruction and a "flow into
+				// non-existing memory" error nobody sweeps.
+				return false;
+			}
 			last = decoded;
 			consumed += decoded.getLength();
 			at = at.add(decoded.getLength());
@@ -788,6 +798,16 @@ public class RTLinkFlowRepairAnalyzer extends AbstractAnalyzer {
 
 		return startsWithPrologue(bytes) || isStrandedEpilogue(program, end, last) ||
 			fallsInto(program, start);
+	}
+
+	/** True if any flow out of {@code instruction} lands outside mapped memory. */
+	private static boolean flowsNowhere(Program program, PseudoInstruction instruction) {
+		for (Address flow : instruction.getFlows()) {
+			if (!program.getMemory().contains(flow)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** {@code PUSH BP; MOV BP,SP} — the frame prologue every routine here opens with. */

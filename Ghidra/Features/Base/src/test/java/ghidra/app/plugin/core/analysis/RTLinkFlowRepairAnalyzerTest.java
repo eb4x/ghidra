@@ -490,4 +490,38 @@ public class RTLinkFlowRepairAnalyzerTest extends AbstractGenericTest {
 			builder.dispose();
 		}
 	}
+
+	/**
+	 * An unresolved RTLink dispatch stub — {@code CALLF dispatcher; JMPF 0000:offset},
+	 * whose segment stays unrelocated until the overlay manager patches it at runtime —
+	 * decodes perfectly and lands exactly on the code after it. It is still not ours:
+	 * {@code RTLinkOverlayAnalyzer} turns these into thunks, and decoding one here
+	 * leaves a real instruction whose flow points into memory that does not exist.
+	 */
+	@Test
+	public void testStubsFlowingIntoNonExistentMemoryAreNotClaimed() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("STUB", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x20);
+			builder.withTransaction(() -> code.setExecute(true));
+			// 0100: PUSH BP; MOV BP,SP; RETF        — a routine, disassembled
+			// 0104: CALLF 1000:0100; JMPF 0000:0341 — the stub, undefined (the gap)
+			// 010e: PUSH BP; MOV BP,SP; RETF        — the next routine
+			builder.setBytes("0x1000:0x0100",
+				"55 8b ec cb " + "9a 00 01 00 10 ea 41 03 00 00 " + "55 8b ec cb");
+			builder.disassemble("0x1000:0x0100", 4, true);
+			builder.disassemble("0x1000:0x010e", 4, true);
+			builder.createFunction("0x1000:0x010e");
+
+			assertEquals("a stub whose jump goes nowhere is not ours to claim", 0,
+				fillGaps(builder));
+			assertNull("the stub must stay undefined for the overlay analyzer",
+				builder.getProgram()
+						.getListing()
+						.getInstructionAt(builder.addr("0x1000:0x0104")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
 }
