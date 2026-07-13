@@ -567,44 +567,79 @@ the reference this analyzer had just added.
 | **`$$RTOVEXEOFFSET` ≠ 0** | Same root cause: we assume the area starts at the image end |
 | **List 3** | Parsed, never applied. Correct: RTLink 6.10 cannot emit one |
 | **`.RTL` / RTLINKST programs** | No specimen |
-| **`XLAT`-indexed state machines** | Declined, and **not for a good reason** — see below and `docs/xlat-handoff.md`. Open work, not a settled decision |
 
 ### The XLAT state machine, and the Sleigh bug behind it
 
-> **This section records an unfinished investigation, not a conclusion.** The claim repeated
-> below and in `RTLinkSwitchTableAnalyzer` — that "nothing in the instruction stream bounds
-> the table" — is a placeholder for work not done, and at least one `XLAT` dispatch in the
-> corpus (VICEROY `210d:3147`, `AND AL,7`) is bounded three bytes before the instruction.
-> The handoff in `docs/xlat-handoff.md` is the live document; treat this one as background.
+> **Resolved (2026-07-13).** Both halves are fixed, in the order the handoff prescribed:
+> the formatter FSM's dispatch is bounded by
+> `RTLinkSwitchTableAnalyzer.recoverFormatterFsmTable`, and the XLAT segment bug in the
+> stock x86 Sleigh spec is fixed (`ia.sinc`, commit `x86: 16-bit XLAT honors its
+> segment`). The claim this section used to repeat — "nothing in the instruction stream
+> bounds the table" — was a placeholder for work not done, and is retracted below.
+> `docs/xlat-handoff.md` records the investigation; an upstream issue/PR draft for the
+> Sleigh bug is in `docs/upstream-xlat-issue.md`.
 
-Each binary's C library carries the MSC formatter — an `XLAT`-driven FSM whose dispatch is a
-CS-relative jump table we deliberately decline (nothing bounds it):
+Each binary's C library carries the MSC `_output` formatter — an `XLAT`-driven FSM,
+byte-identical across the corpus modulo addresses (VICEROY `1d1d:199c`, NEBULAR
+`1417:0d92`, ROE2MAIN `122e:1026`, SPHERE `160f:0c86`):
 
 ```
-1417:0d92  MOV BX,0x4f36        ; class table — a DGROUP offset
-1417:0d9b  XLAT                 ; AL = DS:[BX+AL]
-   ...                          ; second XLAT selects the next state
-1417:0db7  JMP word ptr CS:[BX + 0xd54]
+1417:0d92  MOV BX,0x4f36        ; combined class/transition table — a DGROUP offset
+1417:0d9b  XLAT                 ; AL = DS:[BX+AL]   low nibble = character class
+   ...
+1417:0da9  XLAT                 ; same BX           high nibble = next state
+1417:0dab  INC CL
+1417:0dad  SHR AL,CL            ; state = table[class*8 + current] >> 4
+   ...
+1417:0db6  JMP word ptr CS:[BX + 0xd54]
 ```
 
-It is the source of the one benign warning each binary leaves in the log —
-`Unable to read bytes at ram:0000:4f36`. **That warning is a stock-Ghidra bug, and it is
-load-bearing.** `XLAT` is the only memory access in the whole x86 spec that ignores its
-segment: `ia.sinc` gives the 16-bit form `ptr2(tmp, BX+zext(AL))`, a flat zero-extension,
-where every other 16-bit operand (`Mem16`, `moffs`, the string ops) goes through
-`segment(seg16, offset)` — which the real-mode pspec maps via `<segmentop>`. The constructor
-even parses and prints the segment (`XLAT CS:BX` and `XLAT SS:BX` both occur in SPHERE) and
-then throws it away. In real mode the translate table is therefore read from physical
-`0000:offset` — the interrupt vector table.
+No `CMP` bounds the final index — but the bound is in the FSM's own data. The table is
+MSC's dual-purpose `__lookuptable`: the low nibble of `table[c-' ']` classifies the
+character, the high nibble of `table[class*8 + state]` is the next state, and the two
+regions deliberately share the same bytes. A fixpoint over the reachable
+`(class, state)` pairs yields the exact jump-table entry count — **8 states** in all four
+binaries (same library). `recoverFormatterFsmTable` matches the prologue
+instruction-for-instruction (the `MOV CL,3`/`INC CL` pair proves both shift widths, hence
+both the `class*8` layout and the 16-state `SHR AL,4` ceiling), reads the table via the
+DS program context, and validates every jump-table word against the dispatching
+function's range before claiming anything. It feeds the shared `recoverTable`, so the
+reference pass and the decompiler override both get it. Each binary recovers exactly one
+more switch table (39/83/124/59) and the FSMs decompile as real 8-case state machines.
+`RTLinkFsmSwitchTableTest` covers the recognizer with the transcribed corpus bytes.
 
-**Fixing it makes the analysis worse, which is why the spec is untouched.** Correcting the
-semantics to `segment(seg16, BX+zext(AL))` was tried and reverted: the decompiler then reads
-the class table correctly (DS resolves to DGROUP, as it should) and goes on to resolve the FSM
-jump table it could not reach before — unboundedly, and wrongly. It emits `halt_baddata` cases,
-plants bad flows, and the ERROR bookmarks rise (ROE2MAIN 4 → 6, SPHERE 5 → 6). The unreadable
-table is what currently *stops* the decompiler at the exact place we want it stopped. Taking
-the fix would mean also taking the FSM dispatch away from `DecompilerSwitchAnalyzer` — that is,
-bounding the table ourselves, which needs the state table interpreted, not just read.
+**The Sleigh bug, now fixed:** `XLAT` was the only memory access in the whole x86 spec
+that ignored its segment — `ia.sinc` gave the 16-bit form `ptr2(tmp, BX+zext(AL))`, a
+flat zero-extension, where every other 16-bit operand (`Mem16`, `moffs`, the string ops)
+goes through `segment(seg16, offset)`. The constructor even parses and prints the segment
+(`XLAT CS:BX` and `XLAT SS:BX` both occur in this corpus) and then threw it away. In real
+mode every translate table was therefore read from physical `0000:offset` — the interrupt
+vector table — which is where the one benign-looking warning each binary used to leave
+(`Unable to read bytes at ram:0000:4f36` etc.) came from; and CS:/SS: overrides were
+silently decompiled as DS: reads. The fix is the obvious one-liner
+(`segment(seg16, BX+zext(AL))`), but **order mattered**: taken alone (tried once,
+reverted) it let the decompiler read the class table and then resolve the FSM dispatch
+*unboundedly* — its range analysis honors only `INT_AND` masks, not the `SHR AL,4` — so
+it fabricated cases and planted `halt_baddata` flows (ROE2MAIN 4 → 6 ERROR bookmarks,
+SPHERE 5 → 6). With the FSM bounded first, the fix measures clean on fresh imports of all
+four binaries: warnings gone, ERROR bookmarks unchanged (1/5/5/4), switch tables
+unchanged, and the `XLAT SS:BX` sites in NEBULAR/SPHERE overlay code (a translate loop
+through a caller-passed stack table) decompile correctly instead of silently reading DS.
+
+**The runtime `XLAT CS:BX` sites are not dispatches.** Every binary has the same four
+sites in its runtime segment (VICEROY `210d:3151`/`3188`/`33c4`/`33d5`, ROE2MAIN/SPHERE
+at `+0x2703`/`+0x273a`/`+0x28e1`/`+0x28f2`, NEBULAR shifted): they are the VM nucleus's
+modrm **reg-field decoder** — `AND AL,7; XLAT CS:BX; CBW; MOV SI,AX; MOV AX,[BP+SI]`
+translates an instruction's 3-bit register field through an 8-byte table of
+saved-register frame offsets (x86 register order AX,CX,DX,BX,SP,BP,SI,DI; `FF` = SP,
+not on the frame, sign-checked via the `CBW`) to fetch that register's saved value
+during instruction-fault operand recovery. Ground truth is the compiled OMF module
+`vmnuc` (segment `$$VMNUC`, nine build variants) in `~/dosbox/RTLINK/RTLUTILS.LIB`; no
+vendor assembly source exists for it — `OVLMGR.ASM` is the unrelated *disk* overlay
+manager. These tables also exposed an xref bug, since fixed: the address-of pass used to
+give the `MOV BX,imm` table pointers DS-relative DGROUP references
+(`DAT_2b5a_3171`-style), which the decompiler then consumed as rendering hints;
+`RTLinkXrefAnalyzer.xlatOverrideSegment` now retargets them to the code segment.
 
 <a name="corpus"></a>
 ## Corpus
@@ -613,10 +648,10 @@ Games (measured with the current analyzers, fresh imports):
 
 | Binary | records | stubs | trampolines | switch tables | list-2 sites | ERROR bookmarks |
 |---|---|---|---|---|---|---|
-| VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
-| NEBULAR.EXE | 79 | 831 | 22 | 82 | 90 | 5 |
-| SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
-| ROE2MAIN.EXE | 171 | 1997 | 136 | 58 | 54 | 4 |
+| VICEROY.EXE | 31 | 658 | 371 | 39 | 0 | 1 |
+| NEBULAR.EXE | 79 | 831 | 22 | 83 | 90 | 5 |
+| SPHERE.EXE | 105 | 869 | 65 | 124 | 67 | 5 |
+| ROE2MAIN.EXE | 171 | 1997 | 136 | 59 | 54 | 4 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
 (All measured from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see
@@ -630,10 +665,9 @@ property of the compiler, not of RTLink**: ROE2MAIN doubles the switch index wit
 table dispatches — so before the matcher accepted both forms, it recovered **zero** tables,
 and Ghidra's own switch analyzer filled the vacuum by reading a *string table* as a jump
 table and chasing ASCII pairs (`"AN"`, `"AR"`, `"BO"`) into unmapped segment `4000`. It is
-also the only binary in the corpus with a **DS-relative** jump table (above). Its five
-remaining unrecovered dispatches are `XLAT`-indexed state machines, which we decline on
-purpose: nothing in the instruction stream bounds the table, so the entry count would be a
-guess.
+also the only binary in the corpus with a **DS-relative** jump table (above). Its last
+declined dispatch class — the `XLAT`-indexed formatter FSM — is now recovered too, bounded
+by the FSM's own state table (see the XLAT section above).
 
 **ROE2MAIN also needed a non-RTLink fix**, worth knowing about because it will recur in any
 float-heavy DOS binary. Its floating point is compiled for the **emulator**: each x87

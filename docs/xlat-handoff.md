@@ -1,5 +1,43 @@
 # Handoff: the XLAT problem (Sleigh bug + the state machines we never bounded)
 
+**Status: RESOLVED (2026-07-13).** Everything below is kept as the record of the
+investigation; the current documentation is `docs/rtlink-format.md` ("The XLAT state
+machine, and the Sleigh bug behind it") and the upstream draft is
+`docs/upstream-xlat-issue.md`. What was done, in the order item 2/3 below prescribed:
+
+1. **The FSM is bounded by its own data** (`recoverFormatterFsmTable` in
+   `RTLinkSwitchTableAnalyzer`, + `RTLinkFsmSwitchTableTest`). The table is MSC's
+   dual-purpose `__lookuptable` — class in the low nibble of `table[c-' ']`, next state
+   in the high nibble of `table[class*8+state]`, the regions deliberately overlapping —
+   and a fixpoint over reachable (class, state) pairs gives the exact count: **8 states
+   in all four binaries**, cross-checked against each jump table (which ends exactly at
+   the FSM function's entry point). Phase A (recognizer alone, bug still in place):
+   switch overrides 39/83/124/59 (each baseline+1), ERROR bookmarks unchanged 1/5/5/4,
+   all four FSMs decompile as manually-overridden 8-case switches.
+2. **The Sleigh fix was re-taken** (`ia.sinc:4989` → `segment(seg16,BX+zext(AL))`).
+   Phase B (recognizer + fix, fresh imports): `ram:0000:*` warnings gone, ERROR
+   bookmarks still 1/5/5/4, overrides still 39/83/124/59, FSMs read their real DGROUP
+   tables, and the `XLAT SS:BX` overlay sites decompile as stack-table translate loops.
+3. **The runtime `XLAT CS:` sites were reversed** (item 4): they are the VM nucleus's
+   modrm reg-field → saved-register-frame-offset decoder (fault operand recovery),
+   ground truth the compiled `vmnuc` module in `RTLUTILS.LIB` ($$VMNUC — no vendor .ASM
+   exists; OVLMGR.ASM is the disk overlay manager). Not dispatches. They did expose an
+   xref bug — the address-of pass gave their `MOV BX,imm` table pointers DGROUP refs —
+   fixed via `RTLinkXrefAnalyzer.xlatOverrideSegment` (retarget to CS / withdraw for
+   SS:/ES:).
+4. **Upstream** (item 5): PR-quality draft with the patch, repro, the 32-bit FS/GS
+   `segWide` gap, and the `JumpBasic::calcRange` nzmask gap (bounding would give 16, not
+   8 — necessary context for why the override approach is the local answer) is in
+   `docs/upstream-xlat-issue.md`. Not filed; file it manually.
+
+The section below ("The claim you are here to demolish") was right to be suspicious: the
+counter-examples were real, and the FSM bound was exactly where it predicted — in the
+table data.
+
+---
+
+**Original handoff follows, unchanged.**
+
 **Status:** open. Nothing here is fixed. One attempted fix was measured and reverted
 (`94c6e08683`), and this document exists because the reasoning that led to that revert is
 not good enough.
