@@ -601,6 +601,33 @@ flows into memory that does not exist is never claimed either: that is RTLink's 
 stub (`CALLF dispatcher; JMPF 0000:offset`, segment unrelocated until the overlay manager
 patches it), and it belongs to `RTLinkOverlayAnalyzer`.
 
+**Filler is not code.** The DGROUP segment is mapped executable — there is code down there
+among the data — so its zeroed regions are fair game for anything that disassembles at an
+address it never checked, and something does: a switch's *default* case is disassembled
+**without a reference to it** (`DecompilerSwitchAnalysisCmd`), so a garbage default target
+leaves behind a run of instructions that nothing points at and nothing reaches. NEBULAR carried
+two such islands and SPHERE three — dozens of `ADD [BX+SI],AL` apiece, which is what `00 00`
+decodes to — each running until the disassembler's repeated-byte limiter gave up, leaving the
+ERROR mark that was the only visible trace of any of it. (NEBULAR's first island had been
+decoded *twice*, one byte out of phase; the phase break is the "conflicting instruction" that
+was bookmarked, and it sits in the one-byte hole between the two chains, on no instruction at
+all — which is why the marks are swept over the span the junk covered, not over its
+instructions.)
+
+**The test is on the bytes in memory, never on the instruction**, and the corpus itself
+insists on the distinction: `00 00` is a perfectly real instruction, and SPHERE has one inside
+`OVL023_03D4` (`MOV SI,[BP-0x3e]; ADD [BX+SI],AL; JMP ...` — a byte store), sitting between
+`76 c4` and `eb c2`. What condemns an island is that it lies inside a run of at least sixteen
+zero bytes, which no instruction stream is; and even then it is only deleted if nothing claims
+it — no instruction in it referenced, none a function entry, and none fallen into from outside
+(that last is what keeps this off the handler table behind a non-returning call, which is the
+previous section's business). Instructions that merely *straddle* the edge are left alone:
+`MOV AX,0` is `b8 00 00`, and two of its three bytes are zero. Only zero is claimed as filler —
+a run of `0x90` is a NOP sled, which is real code.
+
+This makes the two halves exact mirrors: **the gap filler will not create code over filler, and
+this will not keep it.**
+
 **Flows through a vector in the code segment.** Ghidra does not follow an indirect far flow,
 so what sits behind one is never disassembled — and, having no reference, is never found by
 anything else either. Every binary here links a vendor driver that reaches its **fatal error

@@ -42,10 +42,15 @@ lives in `Ghidra/Features/Base`:
     one is never decoded — that is where the vendor driver's fatal error handler lives);
     a routine that provably terminates (`INT 21h/4Ch`, or a tail-jump chain into one)
     has its callers' fall-throughs sealed; a "conflicting instruction" bookmark is
-    arbitrated by evidence, and unreferenced junk loses to referenced code; and an
+    arbitrated by evidence, and unreferenced junk loses to referenced code; an
     undefined gap between routines that decodes exactly onto the code after it — a
-    prologue, or a stranded epilogue — is disassembled. Everything unevidenced (padding,
-    zero-run islands, unresolved dispatch stubs) is left strictly alone.
+    prologue, or a stranded epilogue — is disassembled; and instructions decoded out of
+    **zero fill** (a run of ≥16 zero bytes, which no instruction stream is) are deleted,
+    provided nothing references them, none is a function entry, and none is fallen into
+    — the mirror of the gap filler, which refuses to *create* code over filler. Note
+    `00 00` is a real instruction (SPHERE's `OVL023_03D4` stores a byte with one), so the
+    test is always on the bytes in memory, never on the instruction. Unresolved dispatch
+    stubs and NOP sleds are left strictly alone.
 
 Analyzer housekeeping: all five set `setSupportsOneTimeAnalysis()` so they can be re-run
 from Analysis → One Shot on an already-analyzed program. Report success counts with

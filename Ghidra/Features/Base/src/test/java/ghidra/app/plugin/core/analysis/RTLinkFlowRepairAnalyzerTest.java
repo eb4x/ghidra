@@ -671,6 +671,266 @@ public class RTLinkFlowRepairAnalyzerTest extends AbstractGenericTest {
 		}
 	}
 
+	private static int clearFiller(ProgramBuilder builder) throws Exception {
+		Program program = builder.getProgram();
+		int txId = program.startTransaction("clear filler islands");
+		try {
+			return RTLinkFlowRepairAnalyzer.clearFillerIslands(program, TaskMonitor.DUMMY);
+		}
+		finally {
+			program.endTransaction(txId, true);
+		}
+	}
+
+	/** A block of zero fill with a routine before it, and nothing pointing into it. */
+	private ProgramBuilder fillerProgram() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("FILL", ProgramBuilder._X86_16_REAL_MODE);
+		boolean ok = false;
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x60);
+			builder.withTransaction(() -> code.setExecute(true));
+			// 0100: a real routine, ending in RETF — the fill starts at 0104 and runs
+			// to the end of the block, exactly as the DGROUP tail does in the corpus.
+			builder.setBytes("0x1000:0x0100", "55 8b ec cb");
+			builder.disassemble("0x1000:0x0100", 4, true);
+			ok = true;
+			return builder;
+		}
+		finally {
+			if (!ok) {
+				builder.dispose();
+			}
+		}
+	}
+
+	/**
+	 * NEBULAR's island in miniature: something disassembled the zero fill at an address
+	 * it never checked, and did it twice, one byte out of phase — the phase break is
+	 * the "conflicting instruction" the disassembler bookmarks. Both chains must go,
+	 * and neither may be left behind as an orphan.
+	 */
+	@Test
+	public void testZeroFillIslandsAreDeleted() throws Exception {
+		ProgramBuilder builder = fillerProgram();
+		try {
+			Program program = builder.getProgram();
+			Listing listing = program.getListing();
+			builder.disassemble("0x1000:0x0110", 20, false); // chain A, even phase
+			builder.disassemble("0x1000:0x0125", 20, false); // chain B, odd phase
+			builder.withTransaction(() -> {
+				// The conflict mark sits in the one-byte HOLE between the chains —
+				// chain A's last instruction ends at 0x0123, chain B starts at 0x0125 —
+				// so it lies on no instruction at all. That is the real shape (NEBULAR
+				// 2078:18eb), and a sweep that followed instruction extents would miss it.
+				program.getBookmarkManager()
+						.setBookmark(builder.addr("0x1000:0x0124"), BookmarkType.ERROR,
+							Disassembler.ERROR_BOOKMARK_CATEGORY,
+							"Failed to disassemble at 1000:0124 due to conflicting " +
+								"instruction (flow from 1000:0122)");
+				program.getBookmarkManager()
+						.setBookmark(builder.addr("0x1000:0x0137"), BookmarkType.ERROR,
+							Disassembler.ERROR_BOOKMARK_CATEGORY,
+							"Maximum run of repeated byte instructions exceeded " +
+								"(flow from 1000:0135)");
+			});
+			assertNotNull("setup: the fill must be decoded as instructions",
+				listing.getInstructionAt(builder.addr("0x1000:0x0110")));
+
+			assertTrue("every instruction in both chains is deleted",
+				clearFiller(builder) >= 20);
+
+			for (long offset = 0x0104; offset <= 0x015f; offset++) {
+				assertNull("no instruction may survive in the fill at " + offset,
+					listing.getInstructionAt(
+						builder.addr(String.format("0x1000:0x%04x", offset))));
+			}
+			assertNull("the conflict mark in the hole goes with the junk it described",
+				program.getBookmarkManager()
+						.getBookmark(builder.addr("0x1000:0x0124"), BookmarkType.ERROR,
+							Disassembler.ERROR_BOOKMARK_CATEGORY));
+			assertNull("and so does the abandoned-run mark",
+				program.getBookmarkManager()
+						.getBookmark(builder.addr("0x1000:0x0137"), BookmarkType.ERROR,
+							Disassembler.ERROR_BOOKMARK_CATEGORY));
+			assertNotNull("the routine above the fill is untouched",
+				listing.getInstructionAt(builder.addr("0x1000:0x0100")));
+			assertEquals("a second run finds nothing", 0, clearFiller(builder));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/**
+	 * The control that decides the whole design. {@code 00 00} is a real instruction —
+	 * SPHERE's {@code OVL023_03D4} stores a byte with it ({@code MOV SI,[BP-0x3e];
+	 * ADD [BX+SI],AL; JMP ...}) — so the test can never be "this instruction decodes
+	 * from zeros". It is "these bytes are a long run of zeros", and here they are not.
+	 */
+	@Test
+	public void testGenuineZeroInstructionInRealCodeSurvives() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("REAL", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x40);
+			builder.withTransaction(() -> code.setExecute(true));
+			// 8b 76 c4 | 00 00 | eb 02 | cb  — transcribed from SPHERE 02f5ff.
+			builder.setBytes("0x1000:0x0100", "55 8b ec 8b 76 c4 00 00 eb 02 90 90 cb");
+			builder.disassemble("0x1000:0x0100", 13, true);
+			Instruction store =
+				builder.getProgram().getListing().getInstructionAt(builder.addr("0x1000:0x0106"));
+			assertNotNull("setup: the byte store must be decoded", store);
+			assertEquals("ADD", store.getMnemonicString());
+
+			assertEquals("a 00 00 instruction in real code is not fill", 0,
+				clearFiller(builder));
+			assertNotNull("and it must still be there", builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0106")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/**
+	 * An instruction whose bytes only partly lie in the fill — {@code MOV AX,0} is
+	 * {@code b8 00 00} — belongs to the code before it, not to the island.
+	 */
+	@Test
+	public void testInstructionStraddlingTheFillEdgeSurvives() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("EDGE", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x40);
+			builder.withTransaction(() -> code.setExecute(true));
+			// 0100: PUSH BP; MOV BP,SP; MOV AX,0 — the MOV's last two bytes are zeros
+			// and run straight into the fill that follows.
+			builder.setBytes("0x1000:0x0100", "55 8b ec b8 00 00");
+			builder.disassemble("0x1000:0x0100", 6, true);
+			builder.disassemble("0x1000:0x0110", 16, false); // junk decoded from the fill
+
+			clearFiller(builder);
+
+			Instruction mov = builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0103"));
+			assertNotNull("MOV AX,0 is code, not fill", mov);
+			assertEquals("MOV", mov.getMnemonicString());
+			assertNull("the junk decoded from the fill is gone", builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0110")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/** Real code running into the fill claims it: that is Detector E's business. */
+	@Test
+	public void testFillFallenIntoFromRealCodeIsLeftAlone() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("FALL", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x40);
+			builder.withTransaction(() -> code.setExecute(true));
+			builder.setBytes("0x1000:0x0100", "55 8b ec"); // falls straight into the fill
+			builder.disassemble("0x1000:0x0100", 24, true);
+
+			assertEquals("something runs into this fill: not ours to delete", 0,
+				clearFiller(builder));
+			assertNotNull(builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0103")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/** A jump into the fill claims it too. */
+	@Test
+	public void testReferencedFillIsLeftAlone() throws Exception {
+		ProgramBuilder builder = fillerProgram();
+		try {
+			builder.setBytes("0x1000:0x0104", "eb 0a"); // JMP 0110, inside the fill
+			builder.disassemble("0x1000:0x0104", 2, true);
+			builder.disassemble("0x1000:0x0110", 16, false);
+
+			assertEquals("something jumps here: leave it", 0, clearFiller(builder));
+			assertNotNull(builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0110")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/** A NOP sled is real code, however long and however unreferenced. */
+	@Test
+	public void testNopSledIsNotFill() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("NOPS", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x40);
+			builder.withTransaction(() -> code.setExecute(true));
+			builder.setBytes("0x1000:0x0110",
+				"90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90");
+			builder.disassemble("0x1000:0x0110", 20, false);
+
+			assertEquals("0x90 is an instruction, not fill", 0, clearFiller(builder));
+			assertNotNull(builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0110")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/**
+	 * A mark describing junk that is already gone is a fossil. The disassembler never
+	 * takes its bookmarks back, so one outlives the instructions it complained about —
+	 * and on a program repaired by an earlier run there is no longer any instruction
+	 * there to sweep it alongside.
+	 */
+	@Test
+	public void testFossilBookmarkInFillIsSwept() throws Exception {
+		ProgramBuilder builder = fillerProgram();
+		try {
+			Program program = builder.getProgram();
+			// The fill was already cleared; only the mark is left, on undefined bytes.
+			builder.withTransaction(() -> program.getBookmarkManager()
+					.setBookmark(builder.addr("0x1000:0x0123"), BookmarkType.ERROR,
+						Disassembler.ERROR_BOOKMARK_CATEGORY,
+						"Failed to disassemble at 1000:0123 due to conflicting " +
+							"instruction (flow from 1000:0121)"));
+
+			assertEquals("there is no junk left to clear", 0, clearFiller(builder));
+			assertNull("but the mark it left behind must go", program.getBookmarkManager()
+					.getBookmark(builder.addr("0x1000:0x0123"), BookmarkType.ERROR,
+						Disassembler.ERROR_BOOKMARK_CATEGORY));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/** A cleared island must not come straight back through the gap filler. */
+	@Test
+	public void testClearedIslandIsNotRefilled() throws Exception {
+		ProgramBuilder builder = fillerProgram();
+		try {
+			builder.disassemble("0x1000:0x0110", 20, false);
+			assertTrue(clearFiller(builder) > 0);
+
+			assertEquals("the gap filler refuses fill", 0, fillGaps(builder));
+			assertNull("and the island stays undefined", builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0110")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
 	/**
 	 * An unresolved RTLink dispatch stub — {@code CALLF dispatcher; JMPF 0000:offset},
 	 * whose segment stays unrelocated until the overlay manager patches it at runtime —
