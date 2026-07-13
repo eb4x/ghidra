@@ -18,6 +18,8 @@ package ghidra.program.util;
 import static org.junit.Assert.*;
 
 import java.math.BigInteger;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.junit.Test;
 
@@ -27,10 +29,12 @@ import ghidra.app.plugin.core.analysis.ConstantPropagationContextEvaluator;
 import ghidra.program.database.ProgramBuilder;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
@@ -526,6 +530,107 @@ public class ConstantPropogationReferenceTest extends AbstractGenericTest {
 		Reference[] referencesFrom = instr.getReferencesFrom();
 		assertTrue(referencesFrom[0].getReferenceType().isFlow());
 		assertEquals("1400200f9", referencesFrom[0].getToAddress().toString());
+	}
+
+	/*
+	 * 16-bit XLAT reads AL from seg:(BX+AL), DS unless overridden. In the cases below BX=0x10,
+	 * AL=5 and the segment register holds 0x2000 (code selector 0x1234 for CS:), so the table
+	 * read is 2000:0015. Read as a flat BX+AL it would be 0000:0015, which is not in memory.
+	 */
+
+	// MOV AX,0x2000; MOV DS,AX; MOV BX,0x10; MOV AL,5; XLAT; RET
+	private static final String XLAT_DS = "b8 00 20 8e d8 bb 10 00 b0 05 d7 c3";
+
+	@Test
+	public void testXlat16_RealMode_DS() throws Exception {
+		Instruction xlat = analyzeXlat16("x86:LE:16:Real Mode", XLAT_DS);
+		assertReadReferenceTo(xlat, "2000:0015");
+		assertXlatAddressFromSegment(xlat, "DS");
+	}
+
+	@Test
+	public void testXlat16_RealMode_ESOverride() throws Exception {
+		// MOV AX,0x3000; MOV DS,AX; MOV AX,0x2000; MOV ES,AX; MOV BX,0x10; MOV AL,5;
+		// ES: XLAT; RET
+		Instruction xlat = analyzeXlat16("x86:LE:16:Real Mode",
+			"b8 00 30 8e d8 b8 00 20 8e c0 bb 10 00 b0 05 26 d7 c3");
+		assertReadReferenceTo(xlat, "2000:0015");
+		assertXlatAddressFromSegment(xlat, "ES");
+	}
+
+	@Test
+	public void testXlat16_ProtectedMode_DS() throws Exception {
+		Instruction xlat = analyzeXlat16("x86:LE:16:Protected Mode", XLAT_DS);
+		assertReadReferenceTo(xlat, "2000:0015");
+		assertXlatAddressFromSegment(xlat, "DS");
+	}
+
+	@Test
+	public void testXlat16_ProtectedMode_CSOverride() throws Exception {
+		// MOV BX,0x10; MOV AL,5; CS: XLAT; RET
+		Instruction xlat = analyzeXlat16("x86:LE:16:Protected Mode", "bb 10 00 b0 05 2e d7 c3");
+		assertReadReferenceTo(xlat, "1234:0015");
+		assertXlatAddressFromSegment(xlat, "CS");
+	}
+
+	/**
+	 * Runs constant propagation over {@code bytes}, placed at 1234:0000 and ending in
+	 * XLAT; RET, with a table block at 2000:0000, and returns the XLAT.
+	 */
+	private Instruction analyzeXlat16(String language, String bytes) throws Exception {
+		builder = new ProgramBuilder("Xlat16", language);
+		builder.createMemory("code", "1234:0000", 0x40);
+		builder.createMemory("table", "2000:0000", 0x100);
+		builder.setBytes("1234:0000", bytes);
+		int length = bytes.split(" ").length;
+		builder.disassemble("1234:0000", length);
+		builder.createFunction("1234:0000");
+
+		analyzer = new ConstantPropagationAnalyzer();
+		program = builder.getProgram();
+		program.startTransaction("Test");
+
+		Address start = addr("1234:0000");
+		analyze(new AddressSet(start, start.add(length - 1)));
+
+		Instruction xlat = program.getListing().getInstructionBefore(start.add(length - 1));
+		assertEquals("XLAT", xlat.getMnemonicString());
+		return xlat;
+	}
+
+	/** Asserts that the XLAT loads from the output of segment(segment, ...). */
+	private void assertXlatAddressFromSegment(Instruction xlat, String segment) {
+		Language language = program.getLanguage();
+		Varnode segmented = null;
+		Varnode loaded = null;
+		for (PcodeOp op : xlat.getPcode()) {
+			switch (op.getOpcode()) {
+				case PcodeOp.CALLOTHER -> {
+					String name =
+						language.getUserDefinedOpName((int) op.getInput(0).getOffset());
+					assertEquals("segment", name);
+					Varnode base = op.getInput(1);
+					assertEquals(segment,
+						language.getRegister(base.getAddress(), base.getSize()).getName());
+					segmented = op.getOutput();
+				}
+				case PcodeOp.LOAD -> loaded = op.getInput(1);
+				default -> {
+					// address arithmetic and the CS write of a CS: override
+				}
+			}
+		}
+		assertNotNull("XLAT address does not go through segment()", segmented);
+		assertEquals(segmented, loaded);
+	}
+
+	private void assertReadReferenceTo(Instruction instr, String to) {
+		Set<Address> targets = new HashSet<>();
+		for (Reference ref : instr.getReferencesFrom()) {
+			assertTrue(ref + " is a read", ref.getReferenceType().isRead());
+			targets.add(ref.getToAddress());
+		}
+		assertEquals(Set.of(addr(to)), targets);
 	}
 
 	private void assertNoOperandReference(int opIndex, Instruction instr) {
