@@ -518,7 +518,7 @@ Games (measured with the current analyzers, fresh imports):
 | VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
 | NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
 | SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
-| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 74 |
+| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 20 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
 (All measured from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see
@@ -536,10 +536,26 @@ remaining unrecovered dispatches are `XLAT`-indexed state machines, which we dec
 purpose: nothing in the instruction stream bounds the table, so the entry count would be a
 guess.
 
+**ROE2MAIN also needed a non-RTLink fix**, worth knowing about because it will recur in any
+float-heavy DOS binary. Its floating point is compiled for the **emulator**: each x87
+instruction `ESC(D8+n) modrm…` is emitted as `INT (34h+n) modrm…`, and when a coprocessor is
+present the runtime rewrites `CD 3n` in place to `9B D8+n` (WAIT + ESC) — which is why the
+encoding is exactly two bytes. Ghidra's real-mode Sleigh reads `CD 3n` as a plain two-byte
+`INT` and then disassembles the operand bytes as code, so every one of ROE2MAIN's ~1000
+calls derailed the instruction stream. `EmulatedFloatAnalyzer` (new) performs the same
+rewrite the runtime does, and its float code now reads as x87 — `WAIT; FSTP ST0; FSTSW AX;
+SAHF; JNZ`, the compare idiom, previously garbage. That is what took ROE2MAIN's ERROR
+bookmarks from 74 to 20. It is gated on emulator-call density, so the four games (1–8 stray
+`CD 3n` byte pairs each, all coincidence) are untouched. Two lessons are baked into it: the
+rewrite must be driven by the *disassembler*, never a byte scan (a byte scan destroyed the
+dispatch stub whose `JMPF` offset is `0x34CD`), and the clear before re-disassembly must
+reach *past* the call, because the mis-decode leaves the following instructions out of
+phase and they would otherwise block the corrected flow.
+
 The remaining ERROR bookmarks are genuine binary quirks, not analyzer defects: fallthrough
 into an ISR module's own zeroed vector table (VICEROY `275d:0778`), zero-run fragments in
-DGROUP code tails, a Borland RTL call one byte into a patched instruction (NEBULAR
-`1417:0104`), and an FPU-emulator encoding Sleigh cannot decode (SPHERE `160f:010d`).
+DGROUP code tails, and a Borland RTL call one byte into a patched instruction (NEBULAR
+`1417:0104`). SPHERE's `160f:010d` is an emulator call too sparse to trip the density gate.
 
 Vendor examples, imported to `/rtlink-dist` in the Ghidra project (they are small, have C
 source and link scripts, and are the best regression material we have):
