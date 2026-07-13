@@ -68,8 +68,11 @@ import ghidra.util.task.TaskMonitor;
  * Dispatch stubs are 12- or 14-byte sequences: {@code CALLF seg:0DAB} (5 bytes) +
  * {@code JMPF 0000:offset} (5 bytes) + page_id (2 bytes) + an optional module_word
  * (2 bytes). Bits 0-13 of page_id hold a 1-based descriptor index into the overlay
- * descriptor table; index 1 is the global overlay table, so the first code page is
- * index 2 (the 1-based overlay page number is therefore page_id - 1).
+ * descriptor table; descriptor index N is overlay record N - 1, so page_id 1 targets
+ * record 0. Record 0 is a real code page like the rest (in VICEROY.EXE it holds 15.6KB
+ * of code, with its own relocations and 47 stubs targeting it); an earlier revision
+ * assumed it was a non-code "global overlay table" and silently dropped every stub
+ * aimed at it.
  * <p>
  * Pages contain multiple link-time modules, each with its own segment base
  * (CS = page frame + module base paragraph), so the JMPF offset is
@@ -230,15 +233,12 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				return false;
 			}
 
-			List<RTLinkOverlayPage> codePages = allPages.subList(1, allPages.size());
-
 			Msg.info(this, String.format(
-				"RTLink/Plus: Found %d overlay pages (global table + %d code pages) " +
-					"at file offset 0x%X",
-				allPages.size(), codePages.size(), overlayStart));
+				"RTLink/Plus: Found %d overlay pages at file offset 0x%X",
+				allPages.size(), overlayStart));
 
 			List<OverlayBlockInfo> overlayBlocks =
-				createOverlayBlocks(program, fileBytes, codePages, log, monitor);
+				createOverlayBlocks(program, fileBytes, allPages, log, monitor);
 
 			if (applyRelocations && !overlayBlocks.isEmpty()) {
 				monitor.setMessage("RTLink: Applying overlay relocations...");
@@ -305,6 +305,20 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 	/** A resolved dispatch stub awaiting thunk creation once its target is a real function. */
 	private record StubTarget(Address stubAddr, Address targetAddr, int stubSize) {
+	}
+
+	/**
+	 * Index {@code overlayBlocks} by overlay record index (= page index). Stub scans
+	 * look pages up by record index rather than list position, so a record skipped for
+	 * having no code cannot shift every later page onto the wrong block.
+	 */
+	private static Map<Integer, OverlayBlockInfo> blocksByRecord(
+			List<OverlayBlockInfo> overlayBlocks) {
+		Map<Integer, OverlayBlockInfo> byRecord = new HashMap<>();
+		for (OverlayBlockInfo info : overlayBlocks) {
+			byRecord.put(info.page().getPageIndex(), info);
+		}
+		return byRecord;
 	}
 
 	static boolean isOverlayAnalyzed(Program program) {
@@ -521,8 +535,14 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 	}
 
+	/**
+	 * Create an overlay memory block named {@code OVERLAY_<record>} for every overlay
+	 * record with code — including record 0, which earlier revisions wrongly skipped as
+	 * a non-code "global overlay table". Block numbering therefore matches the
+	 * OVLSTUB_NN / RTLINK_HDR_NN record numbering.
+	 */
 	private List<OverlayBlockInfo> createOverlayBlocks(Program program, FileBytes fileBytes,
-			List<RTLinkOverlayPage> codePages, MessageLog log, TaskMonitor monitor)
+			List<RTLinkOverlayPage> pages, MessageLog log, TaskMonitor monitor)
 			throws Exception {
 		List<OverlayBlockInfo> result = new ArrayList<>();
 		SegmentedAddressSpace space =
@@ -530,7 +550,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		Address overlayBase = space.getAddress(INITIAL_SEGMENT_VAL, 0);
 		long fileSize = fileBytes.getSize();
 
-		for (RTLinkOverlayPage page : codePages) {
+		for (RTLinkOverlayPage page : pages) {
 			monitor.checkCancelled();
 
 			int codeSize = page.getCodeSize();
@@ -555,7 +575,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				codeSize = (int) available;
 			}
 
-			String blockName = String.format("OVERLAY_%02d", page.getPageIndex() - 1);
+			String blockName = String.format("OVERLAY_%02d", page.getPageIndex());
 
 			// Note the module bases known from the relocation table in the block
 			// comment; CS-relative absolute offsets in module code (e.g. switch jump
@@ -572,7 +592,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			}
 			else {
 				log.appendMsg(
-					"RTLink: Failed to create block for page " + (page.getPageIndex() - 1));
+					"RTLink: Failed to create block for page " + page.getPageIndex());
 			}
 		}
 
@@ -602,7 +622,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private static String blockComment(RTLinkOverlayPage page, Collection<Integer> bases) {
 		StringBuilder comment = new StringBuilder(
 			String.format("RTLink/Plus overlay page %d (frame=0x%X)",
-				page.getPageIndex() - 1, page.getFrameSize()));
+				page.getPageIndex(), page.getFrameSize()));
 		if (bases.size() > 1) {
 			comment.append(", module base paragraphs:");
 			for (int base : bases) {
@@ -618,8 +638,8 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * A page's relocation table only names a module that some relocation is <i>sited</i>
 	 * in, so a module carrying no segment fixups of its own is invisible there — yet the
 	 * 14-byte stubs that call into it still spell out its base paragraph. In VICEROY.EXE
-	 * this is the sole module of OVERLAY_02 (0x642) and the sixth of OVERLAY_28 (0x67);
-	 * both are confirmed by the segment list, whose per-page flag word marks OVERLAY_02
+	 * this is the sole module of OVERLAY_03 (0x642) and the sixth of OVERLAY_29 (0x67);
+	 * both are confirmed by the segment list, whose per-page flag word marks OVERLAY_03
 	 * as multi-module even though its 652 relocations are all module 0.
 	 * <p>
 	 * Without this the two sets disagree and {@link RTLinkSwitchTableAnalyzer} — which
@@ -665,7 +685,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			RTLinkOverlayPage page, MessageLog log) {
 		Memory memory = program.getMemory();
 		Address blockStart = block.getStart();
-		int pageDisplay = page.getPageIndex() - 1;
+		int pageDisplay = page.getPageIndex();
 
 		// The runtime fixup loop (210d:2e59 in VICEROY.EXE) addresses each patch
 		// site as (frame + seg_index):offset — page-linear seg_index*16 + offset —
@@ -934,8 +954,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 *   [10-11] pp pp             page_id (bits 0-13 = 1-based descriptor index)
 	 *   [12-13] mm mm             module_word (14-byte form only)
 	 * </pre>
-	 * page_id is a descriptor index in which 1 is the global overlay table, so the
-	 * first code page is index 2; the 1-based overlay page number is page_id - 1.
+	 * page_id is a 1-based descriptor index over the overlay records: page_id N targets
+	 * record N - 1, so page_id 1 is record 0 — a real code page, not (as an earlier
+	 * revision assumed) a non-code global table.
 	 * The JMPF offset is relative to the target module's base paragraph within the
 	 * page: 12-byte stubs target module 0, so it is the in-page code offset directly;
 	 * 14-byte stubs carry the module's base paragraph in module_word, and the in-page
@@ -966,6 +987,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		SymbolTable symbolTable = program.getSymbolTable();
 		SegmentedAddressSpace space =
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+		Map<Integer, OverlayBlockInfo> blocksByRecord = blocksByRecord(overlayBlocks);
 		int count = 0;
 		int moduleResolved = 0;
 
@@ -1019,21 +1041,19 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					int jmpfOffset =
 						Short.toUnsignedInt(memory.getShort(searchAddr.add(1)));
 					int pageId = Short.toUnsignedInt(memory.getShort(pageIdAddr));
-					// The stored value is a 1-based descriptor index, NOT the overlay page
-					// number: descriptor index 1 is the global overlay table, so the first
-					// code page is index 2. Convert to a 1-based code-page number (used in
-					// the OVLxx label convention) and a 0-based index into overlayBlocks
-					// (which already excludes the global table at subList(1, ...)).
+					// The stored value is a 1-based descriptor index: descriptor N is
+					// overlay record N - 1, so page_id 1 targets record 0 (a real code
+					// page — see the class javadoc). pageNumber is the record index,
+					// shared by the OVLSTUB/OVL label convention and (since the
+					// record-0 fix) the OVERLAY_NN block names.
 					int descriptorIndex = pageId & PAGE_ID_MASK;
 					int pageNumber = descriptorIndex - 1;
 
-					int blockIndex = pageNumber - 1;
-					if (blockIndex < 0 || blockIndex >= overlayBlocks.size()) {
+					OverlayBlockInfo target = blocksByRecord.get(pageNumber);
+					if (target == null) {
 						searchAddr = searchAddr.add(1);
 						continue;
 					}
-
-					OverlayBlockInfo target = overlayBlocks.get(blockIndex);
 
 					// Distinguish the 12- and 14-byte stub forms (see the method javadoc):
 					// the bytes at +12 either begin the next stub (12-byte form, module 0)
@@ -1309,6 +1329,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		ReferenceManager refManager = program.getReferenceManager();
 		SymbolTable symbolTable = program.getSymbolTable();
 		byte[] pattern = { (byte) 0xCD, (byte) 0x3F };
+		Map<Integer, OverlayBlockInfo> blocksByRecord = blocksByRecord(overlayBlocks);
 		int count = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
@@ -1340,8 +1361,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					int overlayId = Short.toUnsignedInt(memory.getShort(idAddr));
 					int targetOffset = Short.toUnsignedInt(memory.getShort(offAddr));
 
-					if (overlayId < overlayBlocks.size()) {
-						OverlayBlockInfo info = overlayBlocks.get(overlayId);
+					// overlay_id is interpreted as a record index, consistent with the
+					// OVLSTUB naming convention.
+					OverlayBlockInfo info = blocksByRecord.get(overlayId);
+					if (info != null) {
 						Address targetAddr =
 							info.block().getStart().add(targetOffset);
 
@@ -1349,7 +1372,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 							refManager.addMemoryReference(searchAddr, targetAddr,
 								RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
 
-							int pageNum = info.page().getPageIndex() - 1;
+							int pageNum = info.page().getPageIndex();
 							labelAddress(symbolTable,
 								String.format("OVLSTUB_%02d_%04X", pageNum,
 									targetOffset),
@@ -1734,14 +1757,32 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 			// Rebuild the OverlayBlockInfo list from the existing blocks, mirroring
 			// createOverlayBlocks()'s skip logic so stub page indexing lines up.
+			// Programs imported before the record-0 fix name record i's block
+			// OVERLAY_(i-1) and have no block for record 0 at all. Detect that legacy
+			// scheme by the absence of a block for the last code-bearing record, and
+			// keep pairing each record with the block that holds its code, so One Shot
+			// still repairs old DBs (whose record-0 stubs stay unresolved — resolving
+			// them needs a re-import).
 			Memory memory = program.getMemory();
+			int lastCodeRecord = -1;
+			for (RTLinkOverlayPage page : allPages) {
+				if (page.getCodeSize() > 0) {
+					lastCodeRecord = page.getPageIndex();
+				}
+			}
+			boolean legacyNames = lastCodeRecord >= 0 &&
+				memory.getBlock(String.format("OVERLAY_%02d", lastCodeRecord)) == null;
 			List<OverlayBlockInfo> overlayBlocks = new ArrayList<>();
-			for (RTLinkOverlayPage page : allPages.subList(1, allPages.size())) {
+			for (RTLinkOverlayPage page : allPages) {
 				if (page.getCodeSize() <= 0) {
 					continue;
 				}
+				int nameIndex = page.getPageIndex() - (legacyNames ? 1 : 0);
+				if (nameIndex < 0) {
+					continue; // legacy program: no block exists for record 0
+				}
 				MemoryBlock block = memory
-						.getBlock(String.format("OVERLAY_%02d", page.getPageIndex() - 1));
+						.getBlock(String.format("OVERLAY_%02d", nameIndex));
 				if (block == null) {
 					// Unexpected layout (blocks renamed/removed); leave the program alone.
 					return;
