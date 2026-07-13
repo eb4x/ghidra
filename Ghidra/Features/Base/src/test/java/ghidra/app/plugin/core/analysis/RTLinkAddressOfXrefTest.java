@@ -153,4 +153,60 @@ public class RTLinkAddressOfXrefTest extends AbstractGenericTest {
 			builder.dispose();
 		}
 	}
+
+	@Test
+	public void testXlatTableImmediates() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("XLT", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0000", 0x40);
+			builder.withTransaction(() -> code.setExecute(true));
+			builder.createUninitializedMemory("DATA", "0x2000:0x1000", 0x100);
+
+			builder.setBytes("0x1000:0x0000",
+			// @formatter:off
+				"bb 20 00 " + // 0x0000  MOV BX,0x20    -> XLAT CS: table: ref to 1000:0020
+				"24 07 " +    // 0x0003  AND AL,0x7
+				"2e d7 " +    // 0x0005  XLAT CS:BX
+				"bb 10 10 " + // 0x0007  MOV BX,0x1010  -> XLAT SS: table: no ref at all
+				"36 d7 " +    // 0x000a  XLAT SS:BX
+				"bb 10 10 " + // 0x000c  MOV BX,0x1010  -> bare XLAT reads DS: DGROUP ref
+				"d7 " +       // 0x000f  XLAT
+				"c3",         // 0x0010  RET
+			// @formatter:on
+				true);
+			builder.setRegisterValue("DS", "0x1000:0x0000", "0x1000:0x003f", 0x2000);
+
+			Program program = builder.getProgram();
+			ProgramContext context = program.getProgramContext();
+			Register ds = context.getRegister("DS");
+			Memory memory = program.getMemory();
+			ReferenceManager refManager = program.getReferenceManager();
+			SegmentedAddressSpace space =
+				(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+
+			RTLinkXrefAnalyzer.Counts counts = new RTLinkXrefAnalyzer.Counts();
+			builder.withTransaction(() -> {
+				for (Instruction instr : program.getListing().getInstructions(true)) {
+					RTLinkXrefAnalyzer.addDataXrefs(instr, context, ds, memory, refManager,
+						space, counts);
+				}
+			});
+
+			Reference[] csTable = refManager.getReferencesFrom(builder.addr("0x1000:0x0000"));
+			assertEquals("imm feeding XLAT CS: must ref the code-segment table", 1,
+				csTable.length);
+			assertEquals(RefType.DATA, csTable[0].getReferenceType());
+			assertEquals(builder.addr("0x1000:0x0020"), csTable[0].getToAddress());
+
+			assertEquals("imm feeding XLAT SS: must not ref anything", 0,
+				refManager.getReferencesFrom(builder.addr("0x1000:0x0007")).length);
+
+			Reference[] plain = refManager.getReferencesFrom(builder.addr("0x1000:0x000c"));
+			assertEquals("imm feeding a bare XLAT keeps the DGROUP ref", 1, plain.length);
+			assertEquals(builder.addr("0x2000:0x1010"), plain[0].getToAddress());
+		}
+		finally {
+			builder.dispose();
+		}
+	}
 }

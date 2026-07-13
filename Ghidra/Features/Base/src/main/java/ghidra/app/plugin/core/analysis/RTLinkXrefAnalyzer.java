@@ -61,7 +61,12 @@ import ghidra.util.task.TaskMonitor;
  * {@link #isRealModeVideoSegment} (a documented constant heuristic for the video
  * segments, which in a VGA game appear everywhere as far-pointer halves) and
  * {@link #flowsIntoSegmentRegister} (straight-line dataflow: the loaded register
- * is copied into ES/DS/SS within a few instructions).  Stock analysis never makes
+ * is copied into ES/DS/SS within a few instructions).  A third dataflow check,
+ * {@link #xlatOverrideSegment}, catches {@code MOV BX,imm16} feeding a
+ * segment-overridden {@code XLAT}: the immediate is a translate-table offset in
+ * <i>that</i> segment — for {@code XLAT CS:BX} (the overlay manager's reg-field
+ * tables) the reference is retargeted to the code segment, for {@code SS:}/
+ * {@code ES:} it is withdrawn.  Stock analysis never makes
  * these refs &mdash; {@code ConstantPropagationAnalyzer} disables param-constant
  * refs on segmented address spaces and resolves bare constants as segment-0
  * addresses.</li>
@@ -365,6 +370,27 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		if (destReg != null && flowsIntoSegmentRegister(instr, destReg)) {
 			return 0;
 		}
+		if (destReg != null && destReg.getName().equals("BX")) {
+			// XLAT reads [seg:BX+AL]. If this immediate feeds an XLAT with a segment
+			// override, it is a translate-table offset in that segment, not a DGROUP
+			// offset — the overlay manager's reg-field tables (XLAT CS:BX with the
+			// table next to the code) got DGROUP refs this way. Only CS resolves
+			// statically; any other override just withdraws the claim.
+			Register xlatSegment = xlatOverrideSegment(instr, destReg);
+			if (xlatSegment != null) {
+				if (!xlatSegment.getName().equals("CS")) {
+					return 0;
+				}
+				int codeSegment = ((SegmentedAddress) instr.getAddress()).getSegment();
+				Address table = space.getAddress(codeSegment, (int) value);
+				if (memory.getBlock(table) == null) {
+					return 0;
+				}
+				refManager.addMemoryReference(instr.getAddress(), table, RefType.DATA,
+					SourceType.ANALYSIS, opIndex);
+				return 1;
+			}
+		}
 
 		Address target = space.getAddress(dgroup, (int) value);
 		if (!isMappedDataTarget(target, memory)) {
@@ -374,6 +400,56 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 		refManager.addMemoryReference(instr.getAddress(), target, RefType.DATA,
 			SourceType.ANALYSIS, opIndex);
 		return 1;
+	}
+
+	/**
+	 * The overriding segment register of an {@code XLAT} that consumes {@code reg}
+	 * (BX) within the next few fall-through instructions, or null when no such
+	 * consumer is found. A bare {@code XLAT} (or an explicit {@code DS:}) reads
+	 * DS:BX, which is exactly what the DGROUP resolution assumes, so those return
+	 * null too — only {@code CS:}/{@code SS:}/{@code ES:} ({@code 2E/36/26 D7})
+	 * change the answer. Deliberately shallow like
+	 * {@link #flowsIntoSegmentRegister}: straight-line code only, stops at any call
+	 * or when the register is rewritten.
+	 */
+	private static Register xlatOverrideSegment(Instruction instr, Register reg) {
+		Program program = instr.getProgram();
+		Listing listing = program.getListing();
+		Instruction cur = instr;
+		for (int i = 0; i < 4; i++) {
+			Address ft = cur.getFallThrough();
+			if (ft == null) {
+				return null;
+			}
+			cur = listing.getInstructionAt(ft);
+			if (cur == null || cur.getFlowType().isCall()) {
+				return null;
+			}
+			if (cur.getMnemonicString().equals("XLAT")) {
+				byte[] bytes;
+				try {
+					bytes = cur.getBytes();
+				}
+				catch (MemoryAccessException e) {
+					return null;
+				}
+				if (bytes.length != 2 || bytes[1] != (byte) 0xd7) {
+					return null; // bare XLAT: the DS resolution stands
+				}
+				return switch (bytes[0]) {
+					case 0x2e -> program.getLanguage().getRegister("CS");
+					case 0x36 -> program.getLanguage().getRegister("SS");
+					case 0x26 -> program.getLanguage().getRegister("ES");
+					default -> null; // 3E = explicit DS: — same as no override
+				};
+			}
+			for (Object obj : cur.getResultObjects()) {
+				if (obj == reg) {
+					return null; // value replaced before any XLAT
+				}
+			}
+		}
+		return null;
 	}
 
 	/**
