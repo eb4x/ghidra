@@ -567,9 +567,15 @@ the reference this analyzer had just added.
 | **`$$RTOVEXEOFFSET` ≠ 0** | Same root cause: we assume the area starts at the image end |
 | **List 3** | Parsed, never applied. Correct: RTLink 6.10 cannot emit one |
 | **`.RTL` / RTLINKST programs** | No specimen |
-| **`XLAT`-indexed state machines** | Declined on purpose — nothing in the instruction stream bounds the jump table. See below: leave them alone, and mean it |
+| **`XLAT`-indexed state machines** | Declined, and **not for a good reason** — see below and `docs/xlat-handoff.md`. Open work, not a settled decision |
 
 ### The XLAT state machine, and the Sleigh bug behind it
+
+> **This section records an unfinished investigation, not a conclusion.** The claim repeated
+> below and in `RTLinkSwitchTableAnalyzer` — that "nothing in the instruction stream bounds
+> the table" — is a placeholder for work not done, and at least one `XLAT` dispatch in the
+> corpus (VICEROY `210d:3147`, `AND AL,7`) is bounded three bytes before the instruction.
+> The handoff in `docs/xlat-handoff.md` is the live document; treat this one as background.
 
 Each binary's C library carries the MSC formatter — an `XLAT`-driven FSM whose dispatch is a
 CS-relative jump table we deliberately decline (nothing bounds it):

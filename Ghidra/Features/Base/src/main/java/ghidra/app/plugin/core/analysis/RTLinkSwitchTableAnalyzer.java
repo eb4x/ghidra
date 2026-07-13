@@ -660,8 +660,11 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	 * it is safe, because any redefinition of the index register in between aborts the match.
 	 * <p>
 	 * Dispatches with no {@code CMP} at all are rejected: {@code 1d1d:19c0} indexes its table from
-	 * an {@code XLAT} result, so nothing in the instruction stream bounds the table and the entry
-	 * count would be a guess.
+	 * an {@code XLAT} result, so this matcher cannot count the entries and declines rather than
+	 * guess. <b>That is a limit of this matcher, not a property of the code</b> — the state count
+	 * is there to be had, in the translate table's own bytes, and one such dispatch in the corpus
+	 * (VICEROY {@code 210d:3147}) is bounded outright by an {@code AND AL,7}. Bounding these
+	 * properly is open work; see {@code docs/xlat-handoff.md}.
 	 * <p>
 	 * One transformation of the index is allowed between the guard and the scaling: a
 	 * byte divide by a constant. Borland emits it for switches over strided case values
