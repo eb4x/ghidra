@@ -518,11 +518,23 @@ Games (measured with the current analyzers, fresh imports):
 | VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
 | NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
 | SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
-| ROE2MAIN.EXE | 171 | not imported | | | 54 | |
+| ROE2MAIN.EXE | 171 | 1997 | 136 | 57 | 54 | 74 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |
 
-(Record counts, list-2 totals and the ROE2MAIN row are file-level measurements; the rest are
-from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see below.)
+(All measured from fresh Ghidra imports. XANTH imports with **no** overlay blocks — see
+below.)
+
+**ROE2MAIN is the stress case**: 171 records, 671 KB of overlay code, and 1997 stubs — three
+times VICEROY's. Stub and trampoline recovery matched a file-level census exactly on the
+first run (1997/1997, 136/136). It also taught us that **the switch-dispatch idiom is a
+property of the compiler, not of RTLink**: ROE2MAIN doubles the switch index with
+`ADD AX,AX` where the other four games use `SHL AX,1`, and it uses `SHL` at *none* of its 60
+table dispatches — so before the matcher accepted both forms, it recovered **zero** tables,
+and Ghidra's own switch analyzer filled the vacuum by reading a *string table* as a jump
+table and chasing ASCII pairs (`"AN"`, `"AR"`, `"BO"`) into unmapped segment `4000`. Its five
+remaining unrecovered dispatches are `XLAT`-indexed state machines, which we decline on
+purpose: nothing in the instruction stream bounds the table, so the entry count would be a
+guess.
 
 The remaining ERROR bookmarks are genuine binary quirks, not analyzer defects: fallthrough
 into an ISR module's own zeroed vector table (VICEROY `275d:0778`), zero-run fragments in

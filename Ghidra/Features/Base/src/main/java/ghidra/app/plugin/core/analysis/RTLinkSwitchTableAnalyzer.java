@@ -372,10 +372,17 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	 * Table length from the {@code CMP index,N} guard that bounds the switch, or -1 when the idiom
 	 * does not match.
 	 * <p>
-	 * The scaling pair is required, not incidental: {@code SHL index,1} followed by
+	 * The scaling pair is required, not incidental: a doubling of the index followed by
 	 * {@code XCHG index,BX} is what proves the index addresses a table of <i>words</i>, which is
 	 * the whole basis for reading {@code N + 1} shorts. The guard is then the nearest preceding
 	 * {@code CMP} of that same index register.
+	 * <p>
+	 * The doubling is written either {@code SHL index,1} or {@code ADD index,index} — the same
+	 * operation, and which one appears is a property of the compiler, not of the switch.
+	 * ROE2MAIN.EXE uses {@code ADD} at every one of its 60 table dispatches and {@code SHL} at
+	 * none, so requiring {@code SHL} recovered nothing at all there, and left the decompiler to
+	 * mis-recover the tables itself (it read a string table as a jump table and chased ASCII
+	 * pairs into unmapped segments).
 	 * <p>
 	 * Following the value rather than the instruction layout matters. Both
 	 * {@code CMP AX,N; JA default} and {@code CMP AX,N; JBE body; JMP default} occur, and the
@@ -405,8 +412,7 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			return -1;
 		}
 		Instruction scale = exchange.getPrevious();
-		if (scale == null || !"SHL".equals(scale.getMnemonicString()) ||
-			!index.equals(scale.getRegister(0)) || !isOne(scale.getScalar(1))) {
+		if (scale == null || !isDoublingOf(scale, index)) {
 			return -1;
 		}
 
@@ -447,6 +453,22 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			instruction = instruction.getPrevious();
 		}
 		return -1;
+	}
+
+	/**
+	 * True if {@code instruction} doubles {@code index} — {@code SHL index,1} or the
+	 * equivalent {@code ADD index,index}. Which form a compiler picks says nothing about
+	 * the switch; both prove the index is about to address a table of words.
+	 */
+	private static boolean isDoublingOf(Instruction instruction, Register index) {
+		String mnemonic = instruction.getMnemonicString();
+		if (!index.equals(instruction.getRegister(0))) {
+			return false;
+		}
+		if ("SHL".equals(mnemonic)) {
+			return isOne(instruction.getScalar(1));
+		}
+		return "ADD".equals(mnemonic) && index.equals(instruction.getRegister(1));
 	}
 
 	/**
