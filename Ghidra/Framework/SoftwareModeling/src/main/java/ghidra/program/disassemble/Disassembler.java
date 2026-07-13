@@ -608,7 +608,13 @@ public class Disassembler implements DisassemblerConflictHandler {
 				InstructionBlock nextBlock =
 					disassemblerQueue.getNextBlockToBeDisassembled(null, program.getMemory(), null);
 				if (nextBlock == null) {
-					break;
+					// A restricted address set can cause every flow promoted for this
+					// instruction set to be discarded without producing a block, while
+					// deferred call flows still wait in the queue's seed list. Breaking
+					// here would silently abandon those calls -- targets inside the
+					// restricted set would never be disassembled -- so loop back and let
+					// continueProducingInstructionSets() decide whether work remains.
+					continue;
 				}
 				Address blockAddr = nextBlock.getStartAddress();
 				CodeUnit cu = listing.getCodeUnitAt(blockAddr);
