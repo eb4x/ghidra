@@ -134,6 +134,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	/** Max instructions to decode when hunting the DGROUP load in the C startup. */
 	private static final int STARTUP_SCAN_LIMIT = 200;
 
+	/**
+	 * Bodies of the dispatch stubs/trampolines this run actually resolved — the set that
+	 * {@link #analysisEnded} sweeps clean of the disassembler's stale "Bad Instruction"
+	 * marks. Analyzer instances are created per program, so this is program-scoped.
+	 */
+	private AddressSet resolvedStubBodies = new AddressSet();
+
 	private boolean applyRelocations = true;
 	private boolean createStubXrefs = true;
 	private boolean markupHeaders = true;
@@ -787,8 +794,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			// its target as a thunk.
 			for (StubTarget stub : pendingThunks) {
 				monitor.checkCancelled();
-				createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(),
-					log);
+				if (createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(),
+					stub.stubSize(), log)) {
+					clearStubErrorBookmarks(program, stub, monitor);
+				}
 			}
 		}
 
@@ -796,8 +805,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			disassembleResidentTargets(program, trampolineTargets, log, monitor);
 			for (StubTarget stub : pendingTrampolines) {
 				monitor.checkCancelled();
-				createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(), stub.stubSize(),
-					log);
+				if (createThunkAtStub(funcMgr, stub.stubAddr(), stub.targetAddr(),
+					stub.stubSize(), log)) {
+					clearStubErrorBookmarks(program, stub, monitor);
+				}
 			}
 		}
 
@@ -1363,7 +1374,15 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		return count;
 	}
 
-	private static void createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
+	/**
+	 * Wire {@code stubAddr} to {@code targetAddr} as a thunk.
+	 *
+	 * @return true if the stub is resolved (a thunk to its target now exists at it),
+	 *         false if resolution failed or the site was skipped — the caller only
+	 *         clears the stub's stale ERROR bookmarks when this returns true, so a
+	 *         genuine decode failure keeps its mark.
+	 */
+	private static boolean createThunkAtStub(FunctionManager funcMgr, Address stubAddr,
 			Address targetAddr, int stubSize, MessageLog log) {
 		// A CALLF+JMPF pair inside a larger function's body is fallthrough-reachable
 		// code, not a free-standing stub — the overlay manager's own code contains
@@ -1375,7 +1394,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			Msg.debug(RTLinkOverlayAnalyzer.class, String.format(
 				"RTLink: skipping stub thunk at %s -> %s: embedded in %s at %s",
 				stubAddr, targetAddr, containing.getName(), containing.getEntryPoint()));
-			return;
+			return false;
 		}
 
 		Function overlayFunc = funcMgr.getFunctionAt(targetAddr);
@@ -1389,7 +1408,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				log.appendMsg(String.format(
 					"RTLink: no code at target %s for stub %s; stub left unthunked",
 					targetAddr, stubAddr));
-				return;
+				return false;
 			}
 			// The target is code but the bulk CreateFunctionCmd did not cover it
 			// (e.g. the repair path found a new stub). Create it with a real
@@ -1401,7 +1420,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					"RTLink: could not create target function at %s for stub %s " +
 						"(target is likely inside another function's body)",
 					targetAddr, stubAddr));
-				return;
+				return false;
 			}
 		}
 
@@ -1428,7 +1447,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			// Already the correct thunk (e.g. a re-run) — nothing to do.
 			if (existingStub.isThunk() &&
 				overlayFunc.equals(existingStub.getThunkedFunction(false))) {
-				return;
+				return true;
 			}
 			try {
 				// Clear any no-return flag discovered while the stub was still a
@@ -1436,7 +1455,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				// its overlay target returns.
 				existingStub.setNoReturn(false);
 				existingStub.setThunkedFunction(overlayFunc);
-				return;
+				return true;
 			}
 			catch (IllegalArgumentException e) {
 				// A plain function was already carved at the stub (auto-analysis
@@ -1454,12 +1473,85 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			AddressSet stubBody = new AddressSet(stubAddr, stubAddr.add(stubSize - 1));
 			funcMgr.createThunkFunction(null, null, stubAddr, stubBody,
 				overlayFunc, SourceType.ANALYSIS);
+			return true;
 		}
 		catch (OverlappingFunctionException e) {
 			log.appendMsg(String.format(
 				"RTLink: could not create stub thunk at %s -> %s: %s",
 				stubAddr, targetAddr, e.getMessage()));
+			return false;
 		}
+	}
+
+	/**
+	 * Drop the disassembler's stale ERROR bookmarks from a stub we just resolved, and
+	 * remember the stub's body so {@link #analysisEnded} can sweep it again.
+	 * <p>
+	 * A dispatch stub's {@code JMPF 0000:offset} points into unmapped memory until the
+	 * overlay manager patches it at run time, so every disassembly of the stub hits
+	 * "Could not follow disassembly flow into non-existing memory" and drops an ERROR
+	 * "Bad Instruction" bookmark. This analyzer relocates the page, resolves the stub
+	 * and wires it to a real thunk target — which makes that mark a fossil — but nothing
+	 * removed it: a fresh VICEROY.EXE import carried 540 ERROR bookmarks, every one of
+	 * them on a correctly resolved stub. An error channel that is 100% false positives
+	 * is worse than no channel: it is the disassembler's own record of what it could not
+	 * decode, and it was reporting 540 broken things in a DB where nothing was broken.
+	 * <p>
+	 * Only resolved stubs are cleared and recorded. A stub whose resolution genuinely
+	 * failed keeps its bookmark (and its log line), so {@code filter=error} still means
+	 * something.
+	 */
+	private void clearStubErrorBookmarks(Program program, StubTarget stub,
+			TaskMonitor monitor) throws CancelledException {
+		AddressSet stubBody;
+		try {
+			stubBody = new AddressSet(stub.stubAddr(), stub.stubAddr().add(stub.stubSize() - 1));
+		}
+		catch (AddressOutOfBoundsException e) {
+			// Stub body runs off the end of its block — nothing to clear.
+			return;
+		}
+		program.getBookmarkManager().removeBookmarks(stubBody, BookmarkType.ERROR, monitor);
+		resolvedStubBodies.add(stubBody);
+	}
+
+	/**
+	 * Sweep the stale ERROR bookmarks off the stubs this analyzer resolved, once all
+	 * other analyzers are done.
+	 * <p>
+	 * Clearing at resolve time is not enough on a fresh import: this analyzer runs at
+	 * {@code FORMAT_ANALYSIS.after()} — it has to, since it creates the overlay memory
+	 * blocks everything else depends on — so it resolves each stub <em>before</em> the
+	 * disassembler ever walks into it. The "Bad Instruction" marks are therefore stamped
+	 * after we are finished, and are already stale the moment they are written. Removing
+	 * them when analysis ends is the only point at which both facts are on the table.
+	 * The resolve-time clear still matters for the retrofit/one-shot path, where the
+	 * marks are already present when we run.
+	 */
+	@Override
+	public void analysisEnded(Program program) {
+		if (resolvedStubBodies.isEmpty()) {
+			return;
+		}
+		AddressSet stubs = resolvedStubBodies;
+		resolvedStubBodies = new AddressSet();
+
+		BookmarkManager bookmarkMgr = program.getBookmarkManager();
+		long stale = bookmarkMgr.getBookmarkAddresses(BookmarkType.ERROR)
+				.intersect(stubs)
+				.getNumAddresses();
+		if (stale == 0) {
+			return;
+		}
+		try {
+			program.withTransaction("RTLink: clear resolved-stub error bookmarks",
+				() -> bookmarkMgr.removeBookmarks(stubs, BookmarkType.ERROR, TaskMonitor.DUMMY));
+		}
+		catch (CancelledException e) {
+			return; // DUMMY monitor never cancels
+		}
+		Msg.info(this, "RTLink/Plus: Cleared " + stale +
+			" stale Bad Instruction bookmark(s) on resolved dispatch stubs");
 	}
 
 	/**
