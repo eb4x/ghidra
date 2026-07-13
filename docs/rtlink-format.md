@@ -596,7 +596,45 @@ a gap only when the bytes account for themselves *exactly* — every instruction
 the run ends precisely on the boundary of the code that follows, one byte over or under and
 the decode is out of phase — **and** the gap looks like a routine: a frame prologue, a
 stranded epilogue where the next function begins, or a straight fall-through from above. A
-run of one repeated byte is padding by definition and is never claimed.
+run of one repeated byte is padding by definition and is never claimed. A gap whose decode
+flows into memory that does not exist is never claimed either: that is RTLink's own dispatch
+stub (`CALLF dispatcher; JMPF 0000:offset`, segment unrelocated until the overlay manager
+patches it), and it belongs to `RTLinkOverlayAnalyzer`.
+
+**Flows through a vector in the code segment.** Ghidra does not follow an indirect far flow,
+so what sits behind one is never disassembled — and, having no reference, is never found by
+anything else either. Every binary here links a vendor driver that reaches its **fatal error
+handler only through `JMPF CS:[0x656]`**, and the vector is a plain far pointer sitting
+initialized in the image (VICEROY `275d:0656` → `275d:0660`). Behind it: 83 bytes of real
+code — redirect stdout onto stderr (`INT 21h/46h`), print the message, wait for a key,
+`MOV AX,0x4C01; INT 21h` — that no pass had ever decoded. The analyzer follows such a vector
+whenever its four bytes are initialized and point into mapped executable memory (a zero or
+unrelocated vector is a runtime-patched stub, and is left alone).
+
+That handler is also what explains the one ERROR bookmark each binary used to carry
+(VICEROY `275d:0778` and its twins). The driver's routine registers cleanup handlers in a
+twelve-entry table at `CS:0x758` — six bytes each, bounded by the `CMP BX,0x7a0` three
+instructions before the abort — and hooks the PSP's INT 22h termination vector the first time
+it is used. When the table is full it aborts: `PUSH CS; CALL 07a4`, which tail-jumps through
+that vector into the handler, which **terminates the process**. So the call never returns, and
+what follows it is not code at all but the handler table itself — sixty-odd zero bytes the
+disassembler decoded until its repeated-byte limiter gave up. Once the vector is resolved the
+whole chain is provable, and the analyzer proves rather than assumes it: a routine is
+non-returning only if it contains no return instruction and each of its terminal paths is
+either the DOS exit idiom (`INT 21h` with `AH = 4Ch`) or a tail-jump into another routine
+already known to terminate — a fixpoint, so a chain of tail-jumps is followed. Calls to such
+a routine lose their fall-through, and the junk decoded from it is cleared.
+
+Two things about that chain are worth keeping in mind, because both cost a debugging cycle.
+**Ghidra is told that a DOS exit ends the routine** (`FlowOverride.RETURN` on the
+`INT 21h/4Ch`): left unmarked it is just an instruction with a fall-through, and the bytes
+after it get absorbed into the routine that exits — which is how ROE2MAIN's handler came to
+swallow the routine below it (a body of 123 bytes where VICEROY's, whose successor was
+already a function, is 83) and thereby to contain a `RETF` that made it look like it returns.
+And **a tail jump is recognized by the instruction, not by its flow type**: Ghidra's
+shared-return pass rewrites a tail `JMP`/`JMPF` into a call, after which the flow type
+describes what Ghidra made of it rather than what the code does, and the jump's flow list is
+empty — so destinations are taken from the references instead.
 
 <a name="what-the-analyzers-do-not-support"></a>
 ### What the analyzers do not support
