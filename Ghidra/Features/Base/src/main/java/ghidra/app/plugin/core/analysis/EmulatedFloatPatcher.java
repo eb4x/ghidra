@@ -60,7 +60,9 @@ class EmulatedFloatPatcher {
 
 	private static final byte OPCODE_INT = (byte) 0xCD;
 	private static final byte OPCODE_WAIT = (byte) 0x9B;
+	private static final byte OPCODE_NOP = (byte) 0x90;
 	private static final byte PREFIX_ES = (byte) 0x26;
+	private static final byte PREFIX_SS = (byte) 0x36;
 
 	/** {@code INT 34h}..{@code INT 3Bh} stand for {@code ESC 0}..{@code ESC 7} = D8..DF. */
 	private static final int FIRST_ESC_INT = 0x34;
@@ -68,13 +70,37 @@ class EmulatedFloatPatcher {
 	private static final int FIRST_ESC_OPCODE = 0xD8;
 
 	/**
-	 * {@code INT 3Ch} stands for an ESC whose memory operand is {@code ES}-relative: the
-	 * real instruction is {@code WAIT; ES: ESC...}, and the ESC opcode is the byte that
-	 * follows the INT rather than being encoded in the interrupt number. Confirmed by the
-	 * code around it — {@code LES SI,[BP+8]} / {@code MOV ES,[..]} immediately precede these
-	 * sites, i.e. the program has just loaded a far pointer into ES and is dereferencing it.
+	 * {@code INT 3Ch} stands for an ESC carrying a <b>segment override</b>: the real
+	 * instruction is {@code WAIT; <seg>: ESC...}, and the ESC opcode is the byte after the
+	 * INT rather than being encoded in the interrupt number. <b>Bit 7 of that byte selects
+	 * the segment</b>:
+	 * <ul>
+	 * <li>set ({@code D8}-{@code DF}) — {@code ES:}; the opcode is already the ESC.
+	 * Every such site is preceded by {@code LES SI,[BP+8]} or {@code MOV ES,[..]}: the
+	 * program has just loaded a far pointer and is dereferencing it.</li>
+	 * <li>clear ({@code 58}-{@code 5F}) — {@code SS:}; the opcode is the ESC with bit 7
+	 * cleared, and restoring it is part of the patch. Every one of ROE2MAIN's 154 such
+	 * sites has modrm {@code rm=7}, i.e. <b>{@code [BX]}</b> — and the code before it is
+	 * always {@code SUB SP,8; MOV BX,SP}. {@code [BX]} defaults to {@code DS}, so
+	 * addressing that stack temp <em>requires</em> the {@code SS:} override. Restored they
+	 * read {@code FLD/FST/FSTP qword ptr [BX]} — a double being passed by value.</li>
+	 * </ul>
 	 */
 	private static final int SEGMENT_OVERRIDE_INT = 0x3C;
+
+	/**
+	 * {@code INT 3Dh} is {@code FWAIT} — it takes no operand bytes (the byte after it is
+	 * always the start of an ordinary instruction) and sits exactly where a wait belongs:
+	 * between an FPU status store and the read of it
+	 * ({@code FSTSW [BP+x]; INT 3Dh; TEST [BP+x],8}) and immediately before far calls.
+	 * Patches two bytes to two: {@code WAIT} + {@code NOP}.
+	 */
+	private static final int WAIT_INT = 0x3D;
+
+	/** ESC opcodes with bit 7 cleared, as the {@code SS:} form of {@code INT 3Ch} carries them. */
+	private static final int FIRST_MASKED_ESC = 0x58;
+	private static final int LAST_MASKED_ESC = 0x5F;
+	private static final int ESC_HIGH_BIT = 0x80;
 
 	/**
 	 * Below this many emulator calls a program is not treated as float-emulated, and
@@ -191,21 +217,39 @@ class EmulatedFloatPatcher {
 		Address addr = insn.getMinAddress();
 		try {
 			// Work out the real instruction's extent first, while only reading. The
-			// rewritten instruction is longer than the INT it replaces, and the code after
-			// it was decoded from what are really its operand bytes.
+			// rewritten instruction is at least as long as the INT it replaces, and the
+			// code after it was decoded from what are really its operand bytes.
 			byte opcode;
 			int span;
+			Address escAddr = addr.add(2);
+			byte restoredEsc = 0;
+
 			if (vector <= LAST_ESC_INT) {
 				// CD 3n modrm...  ->  9B D8+n modrm...   (WAIT + ESC; operands untouched)
 				opcode = (byte) (FIRST_ESC_OPCODE + vector - FIRST_ESC_INT);
-				span = 3 + displacementLength(memory, addr.add(2));
+				span = 3 + displacementLength(memory, escAddr);
+			}
+			else if (vector == WAIT_INT) {
+				// CD 3D  ->  9B 90   (WAIT + NOP; FWAIT takes no operands)
+				opcode = OPCODE_NOP;
+				span = 2;
 			}
 			else {
-				// CD 3C <ESC> modrm...  ->  9B 26 <ESC> modrm...   (WAIT + ES: override)
-				if (!isEscOpcode(memory, addr.add(2))) {
-					return false;
+				// CD 3C <esc> modrm...  ->  9B <seg> <ESC> modrm...
+				// Bit 7 of the byte after the INT picks the segment: set = ES: and the byte
+				// already is the ESC; clear = SS: and the ESC is the byte with bit 7 put
+				// back. See SEGMENT_OVERRIDE_INT.
+				int esc = Byte.toUnsignedInt(memory.getByte(escAddr));
+				if (esc >= FIRST_ESC_OPCODE && esc <= FIRST_ESC_OPCODE + 7) {
+					opcode = PREFIX_ES;
 				}
-				opcode = PREFIX_ES;
+				else if (esc >= FIRST_MASKED_ESC && esc <= LAST_MASKED_ESC) {
+					opcode = PREFIX_SS;
+					restoredEsc = (byte) (esc | ESC_HIGH_BIT);
+				}
+				else {
+					return false; // not a form this understands; leave it as an INT
+				}
 				span = 4 + displacementLength(memory, addr.add(3));
 			}
 
@@ -229,9 +273,18 @@ class EmulatedFloatPatcher {
 			}
 			program.getListing().clearCodeUnits(addr, last, false);
 
-			byte[] original = { OPCODE_INT, (byte) vector };
+			// Keep the bytes the rewrite overwrites, for the relocation record — three of
+			// them in the SS: form, which also restores the ESC opcode's high bit.
+			byte[] original = restoredEsc != 0
+					? new byte[] { OPCODE_INT, (byte) vector,
+						(byte) (restoredEsc & ~ESC_HIGH_BIT) }
+					: new byte[] { OPCODE_INT, (byte) vector };
 			memory.setByte(addr, OPCODE_WAIT);
 			memory.setByte(addr.add(1), opcode);
+			if (restoredEsc != 0) {
+				// SS: form only — the ESC opcode is stored with bit 7 cleared, so put it back.
+				memory.setByte(escAddr, restoredEsc);
+			}
 
 			// Record the rewrite, exactly as RTLinkOverlayAnalyzer records the relocations
 			// it applies. This is a load-time fixup — the same one the DOS runtime performs
@@ -271,7 +324,7 @@ class EmulatedFloatPatcher {
 			return -1;
 		}
 		int vector = Byte.toUnsignedInt(bytes[1]);
-		return (vector >= FIRST_ESC_INT && vector <= SEGMENT_OVERRIDE_INT) ? vector : -1;
+		return (vector >= FIRST_ESC_INT && vector <= WAIT_INT) ? vector : -1;
 	}
 
 	/**
@@ -295,14 +348,4 @@ class EmulatedFloatPatcher {
 		}
 	}
 
-	/** True if the byte at {@code addr} is an x87 ESC opcode ({@code D8}..{@code DF}). */
-	private static boolean isEscOpcode(Memory memory, Address addr) {
-		try {
-			int opcode = Byte.toUnsignedInt(memory.getByte(addr));
-			return opcode >= FIRST_ESC_OPCODE && opcode <= FIRST_ESC_OPCODE + 7;
-		}
-		catch (MemoryAccessException | AddressOutOfBoundsException e) {
-			return false;
-		}
-	}
 }
