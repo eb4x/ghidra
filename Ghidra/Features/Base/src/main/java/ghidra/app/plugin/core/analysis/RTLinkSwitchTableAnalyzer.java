@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Set;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.services.AbstractAnalyzer;
 import ghidra.app.services.AnalysisPriority;
 import ghidra.app.services.AnalyzerType;
@@ -118,7 +119,7 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			throws CancelledException {
 		ReferenceManager refManager = program.getReferenceManager();
 		AddressSet targets = new AddressSet();
-		int recovered = 0;
+		List<Instruction> dispatches = new ArrayList<>();
 
 		InstructionIterator instructions = program.getListing().getInstructions(set, true);
 		while (instructions.hasNext()) {
@@ -134,15 +135,28 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 					RefType.COMPUTED_JUMP, SourceType.ANALYSIS, Reference.MNEMONIC);
 				targets.addRange(destination, destination);
 			}
-			recovered++;
+			dispatches.add(instruction);
 		}
 
+		int recovered = dispatches.size();
 		if (recovered == 0) {
 			return true;
 		}
 		// Disassemble the real targets now; leaving them undefined would let a later pass drift
 		// back into the table bytes.
 		new DisassembleCommand(targets, null, true).applyTo(program, monitor);
+
+		// The references above extend flows that existing function bodies do not yet
+		// cover, and nothing downstream recomputes them for switches resolved here
+		// (DecompilerSwitchAnalyzer performs this fixup only for its own). Left alone,
+		// a case region discovered late stays outside its owner's body — in
+		// NEBULAR.EXE OVERLAY_19 an entire case chain, containing a second dispatch,
+		// was orphaned that way. Fixups run after the whole recovery loop so a body
+		// absorbs the case flows of every dispatch it reaches, not just the first.
+		for (Instruction dispatch : dispatches) {
+			monitor.checkCancelled();
+			CreateFunctionCmd.fixupFunctionBody(program, dispatch, monitor);
+		}
 
 		// Msg.info only — see RTLinkSwitchOverrideAnalyzer: a success count in the analysis
 		// MessageLog pops the "warnings/errors issued during analysis" dialog.

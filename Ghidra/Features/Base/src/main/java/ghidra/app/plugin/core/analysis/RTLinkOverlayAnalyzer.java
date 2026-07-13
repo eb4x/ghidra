@@ -308,6 +308,38 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
+	 * Digit width used in OVERLAY_/RTLINK_HDR_/OVLSTUB_/OVL numbering: two, or more
+	 * once a record index needs it. A fixed {@code %02d} made SPHERE.EXE (105
+	 * records) collate OVERLAY_100 before OVERLAY_11 in every sorted listing.
+	 */
+	private static int nameWidth(int maxRecordIndex) {
+		return Math.max(2, String.valueOf(maxRecordIndex).length());
+	}
+
+	/** The largest record index among {@code overlayBlocks}. */
+	private static int maxRecordIndex(List<OverlayBlockInfo> overlayBlocks) {
+		int max = 0;
+		for (OverlayBlockInfo info : overlayBlocks) {
+			max = Math.max(max, info.page().getPageIndex());
+		}
+		return max;
+	}
+
+	/**
+	 * The overlay block holding {@code record}'s code under the current width-padded
+	 * naming, or under the fixed-{@code %02d} naming of programs imported before the
+	 * width fix, or null.
+	 */
+	private static MemoryBlock findOverlayBlock(Memory memory, int record, int width) {
+		MemoryBlock block =
+			memory.getBlock(String.format("OVERLAY_%0" + width + "d", record));
+		if (block == null) {
+			block = memory.getBlock(String.format("OVERLAY_%02d", record));
+		}
+		return block;
+	}
+
+	/**
 	 * Index {@code overlayBlocks} by overlay record index (= page index). Stub scans
 	 * look pages up by record index rather than list position, so a record skipped for
 	 * having no code cannot shift every later page onto the wrong block.
@@ -549,6 +581,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 		Address overlayBase = space.getAddress(overlayBaseSegment(program), 0);
 		long fileSize = fileBytes.getSize();
+		int width = nameWidth(pages.get(pages.size() - 1).getPageIndex());
 
 		for (RTLinkOverlayPage page : pages) {
 			monitor.checkCancelled();
@@ -575,7 +608,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				codeSize = (int) available;
 			}
 
-			String blockName = String.format("OVERLAY_%02d", page.getPageIndex());
+			String blockName = String.format("OVERLAY_%0" + width + "d", page.getPageIndex());
 
 			// Note the module bases known from the relocation table in the block
 			// comment; CS-relative absolute offsets in module code (e.g. switch jump
@@ -1029,6 +1062,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		SegmentedAddressSpace space =
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
 		Map<Integer, OverlayBlockInfo> blocksByRecord = blocksByRecord(overlayBlocks);
+		int width = nameWidth(maxRecordIndex(overlayBlocks));
 		int count = 0;
 		int moduleResolved = 0;
 
@@ -1133,10 +1167,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 						RefType.UNCONDITIONAL_CALL, SourceType.ANALYSIS, 0);
 
 					labelAddress(symbolTable,
-						String.format("OVLSTUB_%02d_%04X", pageNumber, targetOffset),
+						String.format("OVLSTUB_%0" + width + "d_%04X", pageNumber,
+							targetOffset),
 						stubAddr);
 					labelAddress(symbolTable,
-						String.format("OVL%02d_%04X", pageNumber, targetOffset),
+						String.format("OVL%0" + width + "d_%04X", pageNumber, targetOffset),
 						targetAddr);
 
 					overlayEntryPoints.add(targetAddr);
@@ -1371,6 +1406,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		SymbolTable symbolTable = program.getSymbolTable();
 		byte[] pattern = { (byte) 0xCD, (byte) 0x3F };
 		Map<Integer, OverlayBlockInfo> blocksByRecord = blocksByRecord(overlayBlocks);
+		int width = nameWidth(maxRecordIndex(overlayBlocks));
 		int count = 0;
 
 		for (MemoryBlock block : memory.getBlocks()) {
@@ -1415,11 +1451,12 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 							int pageNum = info.page().getPageIndex();
 							labelAddress(symbolTable,
-								String.format("OVLSTUB_%02d_%04X", pageNum,
+								String.format("OVLSTUB_%0" + width + "d_%04X", pageNum,
 									targetOffset),
 								searchAddr);
 							labelAddress(symbolTable,
-								String.format("OVL%02d_%04X", pageNum, targetOffset),
+								String.format("OVL%0" + width + "d_%04X", pageNum,
+									targetOffset),
 								targetAddr);
 
 							overlayEntryPoints.add(targetAddr);
@@ -1811,8 +1848,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 					lastCodeRecord = page.getPageIndex();
 				}
 			}
+			int width = nameWidth(allPages.get(allPages.size() - 1).getPageIndex());
 			boolean legacyNames = lastCodeRecord >= 0 &&
-				memory.getBlock(String.format("OVERLAY_%02d", lastCodeRecord)) == null;
+				findOverlayBlock(memory, lastCodeRecord, width) == null;
 			List<OverlayBlockInfo> overlayBlocks = new ArrayList<>();
 			for (RTLinkOverlayPage page : allPages) {
 				if (page.getCodeSize() <= 0) {
@@ -1822,8 +1860,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				if (nameIndex < 0) {
 					continue; // legacy program: no block exists for record 0
 				}
-				MemoryBlock block = memory
-						.getBlock(String.format("OVERLAY_%02d", nameIndex));
+				MemoryBlock block = findOverlayBlock(memory, nameIndex, width);
 				if (block == null) {
 					// Unexpected layout (blocks renamed/removed); leave the program alone.
 					return;
@@ -1860,12 +1897,13 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	private void markupOverlayHeaders(Program program, FileBytes fileBytes,
 			List<RTLinkOverlayPage> allPages, MessageLog log, TaskMonitor monitor)
 			throws Exception {
+		int width = nameWidth(allPages.get(allPages.size() - 1).getPageIndex());
 		for (RTLinkOverlayPage page : allPages) {
 			monitor.checkCancelled();
 
 			int headerAndRelocSize = page.getHeader().getOverheadSizeBytes();
 			Address headerBase = AddressSpace.OTHER_SPACE.getAddress(0);
-			String name = String.format("RTLINK_HDR_%02d", page.getPageIndex());
+			String name = String.format("RTLINK_HDR_%0" + width + "d", page.getPageIndex());
 
 			MemoryBlock headerBlock = MemoryBlockUtils.createInitializedBlock(program, true,
 				name, headerBase, fileBytes, page.getFileOffset(), headerAndRelocSize,
