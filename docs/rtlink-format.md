@@ -273,6 +273,17 @@ Union them (`mergeStubModuleBases`). The segment list's 0x40 flag agrees with th
 with either source alone. VICEROY has 2 stub-only modules; NEBULAR 28 across 15 pages;
 SPHERE 30 across 21.
 
+**And then treat what you have as *anchors*, not boundaries.** The union tells you where
+modules *start*; it does not tell you where one ends, because the values are harvested from
+relocation `seg_index` fields and stub module words, and a page holds paragraphs that are
+neither. Real module content crosses them in both directions we have looked: a case target
+past the next anchor (NEBULAR OVERLAY_78 — a case at `0x356` with the dispatch anchored at
+`0x30`), and a jump table whose last entries sit past it (NEBULAR OVERLAY_26 — table
+`0xa1a`–`0xa25`, anchor `0xa2` = `0xa20`, so the anchor lands *inside* the table). Using "the
+next anchor" as a hard end has cost us the same way twice: the table is rejected,
+`DecompilerSwitchAnalyzer` claims the dispatch instead, and its cases land in other segments
+entirely. Anchor a displacement with them; bound nothing with them.
+
 ## VM runtime
 
 Everything in this section is RE against the fingerprinted manager (offsets quoted from
@@ -565,7 +576,7 @@ Games (measured with the current analyzers, fresh imports):
 | Binary | records | stubs | trampolines | switch tables | list-2 sites | ERROR bookmarks |
 |---|---|---|---|---|---|---|
 | VICEROY.EXE | 31 | 658 | 371 | 38 | 0 | 1 |
-| NEBULAR.EXE | 79 | 831 | 22 | 80 | 90 | 6 |
+| NEBULAR.EXE | 79 | 831 | 22 | 82 | 90 | 5 |
 | SPHERE.EXE | 105 | 869 | 65 | 123 | 67 | 5 |
 | ROE2MAIN.EXE | 171 | 1997 | 136 | 58 | 54 | 4 |
 | XANTH.EXE | — (sections) | — | — | — | — | — |

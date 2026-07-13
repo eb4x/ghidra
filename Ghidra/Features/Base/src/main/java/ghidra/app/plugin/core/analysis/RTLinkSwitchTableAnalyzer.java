@@ -485,19 +485,27 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	 * <p>
 	 * The recorded base set is not exhaustive — a module referenced by no relocation
 	 * does not appear — and a missing base would make this resolve against the previous
-	 * module. Guarding against that, the table is rejected whole if it escapes the
-	 * window up to the next recorded base or any entry lands in the middle of an
+	 * module. Two things guard against that: an entry may not land in the middle of an
 	 * existing instruction (overlay code reachable from dispatch stubs is already
-	 * disassembled when this runs).
+	 * disassembled when this runs), and none may land inside the table's own bytes.
 	 * <p>
-	 * The <i>entries</i> themselves are only bounded by the block, not by the next
-	 * recorded base: the bases are paragraph anchors taken from relocation seg_index
-	 * values and stub module words, not strict module boundaries, and real case
-	 * targets cross them (NEBULAR.EXE OVERLAY_78: dispatch at 0x31a anchored at base
-	 * 0x30 has its default and one case at 0x356, past the recorded anchor 0x35).
-	 * Rejecting on the next base there handed the table to DecompilerSwitchAnalyzer,
-	 * which anchored it at the page start and wrote cross-segment garbage flows into
-	 * resident code and dispatch stubs.
+	 * <b>What the bases do not do is bound anything.</b> They are paragraph anchors taken
+	 * from relocation seg_index values and stub module words, not module boundaries, and
+	 * real module content crosses them — so the <i>entries</i> are bounded by the block
+	 * (NEBULAR.EXE OVERLAY_78: dispatch at 0x31a anchored at base 0x30 has its default and
+	 * one case at 0x356, past the recorded anchor 0x35), and so is an <i>adjacent</i>
+	 * table. A table that begins at the byte right after the dispatch — the inline form
+	 * the compiler emits — <b>proves its own anchor</b>: an anchor error is a nonzero
+	 * multiple of 16, so a wrong base could not have put the table there. Only a
+	 * non-adjacent table, which has nothing but the anchor behind it, still has to fit in
+	 * the window up to the next base.
+	 * <p>
+	 * That distinction is not academic: NEBULAR's OVERLAY_25 (dispatch 0x321, table 0x326,
+	 * 10 entries) and OVERLAY_26 (dispatch 0xa15, table 0xa1a, 6 entries) both anchor
+	 * correctly and then run a few bytes past the next anchor — 0x330 and 0xa20 — because
+	 * that anchor sits inside their table. Rejecting them on it handed both to
+	 * DecompilerSwitchAnalyzer, which scattered their cases across resident segments
+	 * 1f95, 2078 and 2000 and left a dozen p-code errors chasing the result.
 	 */
 	private static List<Address> recoverOverlayTable(Program program, Instruction instruction,
 			MemoryBlock block) {
@@ -533,11 +541,18 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			return null;
 		}
 
-		long lastByte = (long) displacement + 2L * entries - 1;
-		if (lastByte > 0xffffL || moduleStart + lastByte >= moduleEnd) {
+		if ((long) displacement + 2L * entries - 1 > 0xffffL) {
 			return null;
 		}
-		Address table = start.add(moduleStart + displacement);
+		long tableOffset = moduleStart + displacement;
+		long tableEnd = tableOffset + 2L * entries;
+		// An adjacent table vouches for its own anchor, so the block is bound enough; a
+		// table anywhere else has only the anchor behind it and must fit the module window.
+		long limit = tableOffset == dispatchOffset + DISPATCH_LENGTH ? blockSize : moduleEnd;
+		if (tableEnd > limit) {
+			return null;
+		}
+		Address table = start.add(tableOffset);
 
 		Set<Address> destinations = new LinkedHashSet<>();
 		Listing listing = program.getListing();
@@ -547,6 +562,9 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 				long destinationOffset = moduleStart + offset;
 				if (destinationOffset >= blockSize) {
 					return null;
+				}
+				if (destinationOffset >= tableOffset && destinationOffset < tableEnd) {
+					return null; // a case target inside its own table: the base is wrong
 				}
 				Address destination = start.add(destinationOffset);
 				Instruction existing = listing.getInstructionContaining(destination);
