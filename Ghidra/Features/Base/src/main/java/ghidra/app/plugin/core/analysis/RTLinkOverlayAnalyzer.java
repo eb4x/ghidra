@@ -547,7 +547,7 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		List<OverlayBlockInfo> result = new ArrayList<>();
 		SegmentedAddressSpace space =
 			(SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
-		Address overlayBase = space.getAddress(INITIAL_SEGMENT_VAL, 0);
+		Address overlayBase = space.getAddress(overlayBaseSegment(program), 0);
 		long fileSize = fileBytes.getSize();
 
 		for (RTLinkOverlayPage page : pages) {
@@ -598,6 +598,39 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		Msg.debug(this, "RTLink/Plus: Created " + result.size() + " overlay memory blocks");
 		return result;
+	}
+
+	/**
+	 * Segment paragraph where the overlay blocks are based: the first 0x100-paragraph
+	 * boundary past the end of the loaded image (highest base-space block). Basing the
+	 * overlays above the image — instead of on top of its low segments at the old
+	 * fixed 0x1000 — keeps the overlay address spaces from shadowing resident code. A
+	 * relocated far call/jump in overlay code always targets the resident image (an
+	 * intra-page target cannot be statically encoded; those go through the dispatch
+	 * stubs), but the disassembler binds a flow whose flat target lies inside the
+	 * instruction's own overlay space back into that space. Under the old base that
+	 * planted garbage code over real page bytes: NEBULAR.EXE OVERLAY_59 held
+	 * {@code CALLF 1089:01a1} (= resident 1085:01e1), which was bound to the page's
+	 * own 0xa31 and collided with the genuine stub entry at 0xa2e, leaving a husk
+	 * and an uncleared ERROR bookmark.
+	 */
+	private static int overlayBaseSegment(Program program) {
+		AddressSpace base = program.getAddressFactory().getDefaultAddressSpace();
+		long maxEnd = 0;
+		for (MemoryBlock block : program.getMemory().getBlocks()) {
+			Address end = block.getEnd();
+			if (end.getAddressSpace().equals(base) && end.getOffset() > maxEnd) {
+				maxEnd = end.getOffset();
+			}
+		}
+		int segment = (int) ((maxEnd >> 4) + 1 + 0xff) & ~0xff;
+		if (segment + 0x1000 > 0xffff) {
+			// The image nearly fills the segmented space; fall back to the old base
+			// rather than collide with the 20-bit limit. Shadowing returns, but only
+			// for an image layout no RTLink binary seen so far comes close to.
+			return INITIAL_SEGMENT_VAL;
+		}
+		return segment;
 	}
 
 	/**
