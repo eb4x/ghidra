@@ -605,9 +605,10 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	 * boundary past the end of the loaded image (highest base-space block). Basing the
 	 * overlays above the image — instead of on top of its low segments at the old
 	 * fixed 0x1000 — keeps the overlay address spaces from shadowing resident code. A
-	 * relocated far call/jump in overlay code always targets the resident image (an
-	 * intra-page target cannot be statically encoded; those go through the dispatch
-	 * stubs), but the disassembler binds a flow whose flat target lies inside the
+	 * list-1-relocated far call/jump in overlay code always targets the resident
+	 * image (the statically encoded intra-page far calls are the list-2 sites, whose
+	 * frame-relative words land inside the block itself, where overlay-space binding
+	 * is correct), but the disassembler binds a flow whose flat target lies inside the
 	 * instruction's own overlay space back into that space. Under the old base that
 	 * planted garbage code over real page bytes: NEBULAR.EXE OVERLAY_59 held
 	 * {@code CALLF 1089:01a1} (= resident 1085:01e1), which was bound to the page's
@@ -731,18 +732,25 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		// the program image base, so getImageBase() would yield 0 here.
 		//
 		// List 2: the word is a PAGE-RELATIVE segment — a paragraph offset within the
-		// page (0 = the page's own base, or one of its module bases). Verified against
-		// the corpus: 211 of 211 list-2 sites across NEBULAR, ROE2MAIN and SPHERE hold a
-		// value below their page's paragraph count, while list-1 sites essentially never
-		// do. The runtime resolves such a site as frame + value, and re-applies the
-		// difference every time the page moves (that is the whole reason the linker keeps
-		// them in a separate list). Statically the page's "frame" is the overlay block's
-		// own base segment, so that is the delta to add here.
+		// page (0 = the page's own base, or one of its module bases). Every site seen
+		// is the segment word of a statically encoded intra-page far call between two
+		// modules of the same page (CALLF module:offset). Verified two ways: 211 of 211
+		// list-2 sites across NEBULAR, ROE2MAIN and SPHERE hold a value below their
+		// page's paragraph count (list-1 sites essentially never do), and the runtime
+		// list-2 fixup call (VICEROY 210d:233f; byte-identical in NEBULAR and SPHERE)
+		// reads the count from header +0xA, rounds the start index up to a 4-entry
+		// group exactly as RTLinkPageHeader models, and adds currentFrame -
+		// previousFrame on every page move — the invariant is word = file word +
+		// current frame. Statically the page's "frame" is the overlay block's own base
+		// segment, so that is the delta to add here; the patched word then lands the
+		// call inside its own overlay block, which is also where the disassembler
+		// binds it.
 		//
-		// Both deltas happen to be 0x1000 today — the image base and the overlay block
-		// base coincide — but they are not the same quantity, so derive each one. The
-		// block's start cannot be cast to SegmentedAddress (an overlay of a segmented
-		// space hands back a GenericAddress), so take its paragraph from the offset.
+		// The two deltas coincided at 0x1000 before the overlays were rebased above
+		// the image; they are different quantities and differ in every program now, so
+		// derive each one. The block's start cannot be cast to SegmentedAddress (an
+		// overlay of a segmented space hands back a GenericAddress), so take its
+		// paragraph from the offset.
 		int loadDelta = INITIAL_SEGMENT_VAL;
 		int frameDelta = (int) (blockStart.getOffset() >>> 4) & 0xffff;
 
