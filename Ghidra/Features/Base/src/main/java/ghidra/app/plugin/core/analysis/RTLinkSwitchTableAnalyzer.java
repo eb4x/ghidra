@@ -219,9 +219,19 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	 * <p>
 	 * The recorded base set is not exhaustive — a module referenced by no relocation
 	 * does not appear — and a missing base would make this resolve against the previous
-	 * module. Guarding against that, the table is rejected whole if any entry escapes
-	 * the module or lands in the middle of an existing instruction (overlay code
-	 * reachable from dispatch stubs is already disassembled when this runs).
+	 * module. Guarding against that, the table is rejected whole if it escapes the
+	 * window up to the next recorded base or any entry lands in the middle of an
+	 * existing instruction (overlay code reachable from dispatch stubs is already
+	 * disassembled when this runs).
+	 * <p>
+	 * The <i>entries</i> themselves are only bounded by the block, not by the next
+	 * recorded base: the bases are paragraph anchors taken from relocation seg_index
+	 * values and stub module words, not strict module boundaries, and real case
+	 * targets cross them (NEBULAR.EXE OVERLAY_78: dispatch at 0x31a anchored at base
+	 * 0x30 has its default and one case at 0x356, past the recorded anchor 0x35).
+	 * Rejecting on the next base there handed the table to DecompilerSwitchAnalyzer,
+	 * which anchored it at the page start and wrote cross-segment garbage flows into
+	 * resident code and dispatch stubs.
 	 */
 	private static List<Address> recoverOverlayTable(Program program, Instruction instruction,
 			MemoryBlock block) {
@@ -269,7 +279,7 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			for (int i = 0; i < entries; i++) {
 				int offset = program.getMemory().getShort(table.add(2L * i)) & 0xffff;
 				long destinationOffset = moduleStart + offset;
-				if (destinationOffset >= moduleEnd) {
+				if (destinationOffset >= blockSize) {
 					return null;
 				}
 				Address destination = start.add(destinationOffset);
@@ -361,6 +371,15 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 	 * Dispatches with no {@code CMP} at all are rejected: {@code 1d1d:19c0} indexes its table from
 	 * an {@code XLAT} result, so nothing in the instruction stream bounds the table and the entry
 	 * count would be a guess.
+	 * <p>
+	 * One transformation of the index is allowed between the guard and the scaling: a
+	 * byte divide by a constant. Borland emits it for switches over strided case values
+	 * ({@code SUB AX,base; CMP AX,span; JA default; MOV BL,stride; DIV BL; OR AH,AH;
+	 * JNZ default; SHL AX,1; ...} — NEBULAR.EXE OVERLAY_27::0100ff, cases 0x14,0x1e,..,0x8c),
+	 * so the {@code CMP} bounds the pre-divide value and the table has
+	 * {@code span/stride + 1} entries. The divisor must resolve to a {@code MOV reg,imm}
+	 * in the scanned window; a divide whose constant is not found rejects the site
+	 * rather than guessing.
 	 */
 	private static int tableEntryCount(Instruction dispatch, MemoryBlock block) {
 		Instruction exchange = dispatch.getPrevious();
@@ -377,6 +396,8 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			return -1;
 		}
 
+		long divisor = 1;
+		Register pendingDivisor = null; // divide crossed, its constant not yet seen
 		Instruction instruction = scale.getPrevious();
 		for (int i = 0; i < GUARD_SCAN_LIMIT && instruction != null; i++) {
 			if (!block.contains(instruction.getMinAddress())) {
@@ -385,18 +406,47 @@ public class RTLinkSwitchTableAnalyzer extends AbstractAnalyzer {
 			if ("CMP".equals(instruction.getMnemonicString()) &&
 				index.equals(instruction.getRegister(0))) {
 				Scalar bound = instruction.getScalar(1);
-				if (bound == null) {
+				if (bound == null || pendingDivisor != null) {
 					return -1;
 				}
-				long entries = bound.getUnsignedValue() + 1;
+				long entries = bound.getUnsignedValue() / divisor + 1;
 				return entries > MAX_TABLE_ENTRIES ? -1 : (int) entries;
 			}
-			if (defines(instruction, index)) {
+			if (pendingDivisor != null && "MOV".equals(instruction.getMnemonicString()) &&
+				pendingDivisor.equals(instruction.getRegister(0))) {
+				Scalar value = instruction.getScalar(1);
+				if (value == null || value.getUnsignedValue() == 0) {
+					return -1;
+				}
+				divisor = value.getUnsignedValue();
+				pendingDivisor = null;
+			}
+			else if (isByteDivideOf(instruction, index)) {
+				if (divisor != 1 || pendingDivisor != null) {
+					return -1; // a second divide: not an idiom this understands
+				}
+				pendingDivisor = instruction.getRegister(0);
+			}
+			else if (defines(instruction, index)) {
 				return -1; // the compared value is not the value that indexes the table
 			}
 			instruction = instruction.getPrevious();
 		}
 		return -1;
+	}
+
+	/**
+	 * True for {@code DIV r8} where {@code index} is AX — the only 8-bit divide form,
+	 * quotient in AL/AX. The remainder lands in AH, so the {@code OR AH,AH; JNZ}
+	 * exactness check between the divide and the scaling never writes the index
+	 * register and needs no special handling here.
+	 */
+	private static boolean isByteDivideOf(Instruction instruction, Register index) {
+		if (!"DIV".equals(instruction.getMnemonicString()) || !"AX".equals(index.getName())) {
+			return false;
+		}
+		Register divisor = instruction.getRegister(0);
+		return divisor != null && divisor.getMinimumByteSize() == 1;
 	}
 
 	/** The register operand of {@code instruction} that is not {@code name}, or null. */
