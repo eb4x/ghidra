@@ -15,6 +15,8 @@
  */
 package ghidra.app.plugin.core.analysis;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.services.*;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.program.model.address.*;
@@ -133,6 +135,7 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 
 		int overlayCount = 0;
 		Counts counts = new Counts();
+		AddressSet undefinedFarTargets = new AddressSet();
 
 		InstructionIterator instrIter = listing.getInstructions(set, true);
 		while (instrIter.hasNext()) {
@@ -140,11 +143,36 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 			Instruction instr = instrIter.next();
 
 			if (doOverlayXrefs) {
-				overlayCount += addOverlayFarXref(instr, memory, refManager, space);
+				overlayCount += addOverlayFarXref(instr, memory, listing, refManager, space,
+					undefinedFarTargets);
 			}
 			if (doDataXrefs) {
 				addDataXrefs(instr, context, ds, memory, refManager, space, counts);
 			}
+		}
+
+		// A far-call/jump reference into undefined bytes is a husk factory: the
+		// reference alone makes the stock subroutine pass plant a function there,
+		// and with no instruction at the entry its body is fabricated as a single
+		// byte. These targets are reachable only from overlay code (anything with a
+		// resident-side flow is already disassembled), so disassemble them now.
+		// A function may already sit on the target -- the overlay pass's committed
+		// CALLF instructions carry flow references, and the subroutine pass reacts
+		// to those long before this analyzer runs -- so recompute its body from the
+		// new code; a 1-byte husk body would otherwise persist forever.
+		if (!undefinedFarTargets.isEmpty()) {
+			new DisassembleCommand(undefinedFarTargets, null, true).applyTo(program, monitor);
+			FunctionManager funcMgr = program.getFunctionManager();
+			for (Address target : undefinedFarTargets.getAddresses(true)) {
+				monitor.checkCancelled();
+				Instruction instr = listing.getInstructionAt(target);
+				if (instr != null && funcMgr.getFunctionAt(target) != null) {
+					CreateFunctionCmd.fixupFunctionBody(program, instr, monitor);
+				}
+			}
+			Msg.info(this, "RTLink/Plus: Disassembled " +
+				undefinedFarTargets.getNumAddresses() +
+				" far call/jump target(s) reachable only from overlay code");
 		}
 
 		if (overlayCount > 0) {
@@ -164,9 +192,12 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 	/**
 	 * Far call/jump pass: create a reference from an overlay-block far call/jump
 	 * to its main-program target.  Returns the number of references created (0 or 1).
+	 * A target still made of undefined bytes is added to {@code undefinedTargets}
+	 * for the caller to disassemble in one batch.
 	 */
-	private static int addOverlayFarXref(Instruction instr, Memory memory,
-			ReferenceManager refManager, SegmentedAddressSpace mainSpace) {
+	private static int addOverlayFarXref(Instruction instr, Memory memory, Listing listing,
+			ReferenceManager refManager, SegmentedAddressSpace mainSpace,
+			AddressSet undefinedTargets) {
 		MemoryBlock instrBlock = memory.getBlock(instr.getAddress());
 		if (instrBlock == null || !instrBlock.isOverlay()) {
 			return 0;
@@ -196,6 +227,10 @@ public class RTLinkXrefAnalyzer extends AbstractAnalyzer {
 					: RefType.UNCONDITIONAL_JUMP;
 				refManager.addMemoryReference(instr.getAddress(), targetAddr,
 					refType, SourceType.ANALYSIS, 0);
+				if (targetBlock.isExecute() && targetBlock.isInitialized() &&
+					listing.getUndefinedDataAt(targetAddr) != null) {
+					undefinedTargets.add(targetAddr);
+				}
 				return 1;
 			}
 		}
