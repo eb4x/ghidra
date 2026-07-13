@@ -35,13 +35,17 @@ lives in `Ghidra/Features/Base`:
   - `RTLinkFlowRepairAnalyzer` — BYTE, `LOW_PRIORITY.after()` (dead last, once every
     other pass has planted its flows and the disassembler has stamped its conflict
     bookmarks). Recovers **buried code** — real, evidenced instructions left
-    undisassembled under junk. Three detectors: a CALL whose fall-through lands on an
-    MZ-relocated segment word cannot return there, so the word is sealed as data and the
-    call marked `CALL_RETURN`; a "conflicting instruction" bookmark is arbitrated by
-    evidence, and unreferenced junk loses to referenced code; and an undefined gap
-    between routines that decodes exactly onto the code after it — a prologue, or a
-    stranded epilogue — is disassembled. Everything unevidenced (padding, zero-run
-    islands) is left strictly alone.
+    undisassembled under junk, or never reached at all. Detectors: a CALL whose
+    fall-through lands on an MZ-relocated segment word cannot return there, so the word
+    is sealed as data and the call marked `CALL_RETURN`; far jumps/calls through an
+    initialized `CS:[imm16]` vector are followed (Ghidra will not, so what lies behind
+    one is never decoded — that is where the vendor driver's fatal error handler lives);
+    a routine that provably terminates (`INT 21h/4Ch`, or a tail-jump chain into one)
+    has its callers' fall-throughs sealed; a "conflicting instruction" bookmark is
+    arbitrated by evidence, and unreferenced junk loses to referenced code; and an
+    undefined gap between routines that decodes exactly onto the code after it — a
+    prologue, or a stranded epilogue — is disassembled. Everything unevidenced (padding,
+    zero-run islands, unresolved dispatch stubs) is left strictly alone.
 
 Analyzer housekeeping: all five set `setSupportsOneTimeAnalysis()` so they can be re-run
 from Analysis → One Shot on an already-analyzed program. Report success counts with

@@ -491,6 +491,186 @@ public class RTLinkFlowRepairAnalyzerTest extends AbstractGenericTest {
 		}
 	}
 
+	private static int resolveVectors(ProgramBuilder builder) throws Exception {
+		Program program = builder.getProgram();
+		int txId = program.startTransaction("resolve far vectors");
+		try {
+			return RTLinkFlowRepairAnalyzer.resolveFarVectorFlows(program, TaskMonitor.DUMMY);
+		}
+		finally {
+			program.endTransaction(txId, true);
+		}
+	}
+
+	private static int sealNonReturning(ProgramBuilder builder) throws Exception {
+		Program program = builder.getProgram();
+		int txId = program.startTransaction("seal non-returning calls");
+		try {
+			return RTLinkFlowRepairAnalyzer.sealCallsThatCannotReturn(program,
+				TaskMonitor.DUMMY);
+		}
+		finally {
+			program.endTransaction(txId, true);
+		}
+	}
+
+	/**
+	 * The vendor driver's abort path, in miniature. Nothing reaches the fatal handler
+	 * except an indirect far jump through a vector in the code segment, so no pass ever
+	 * decodes it; and because the abort never returns, the disassembler runs the call's
+	 * fall-through into the handler table behind it and decodes zeros until its
+	 * repeated-byte limiter gives up.
+	 * <pre>
+	 *   0100  9a 20 01 00 10   CALLF abort (1000:0120)   ; registration table full
+	 *   0105  00 00 ... 00     the handler table         ; zeros: data, not code
+	 *   0120  2e ff 2e 40 01   JMPF CS:[0x140]           ; abort tail-jumps via vector
+	 *   0130  b8 01 4c cd 21   MOV AX,0x4C01; INT 0x21   ; the handler: DOS terminate
+	 *   0140  30 01 00 10      the vector: far ptr 1000:0130
+	 * </pre>
+	 */
+	private ProgramBuilder abortProgram() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("EXIT", ProgramBuilder._X86_16_REAL_MODE);
+		boolean ok = false;
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x50);
+			builder.withTransaction(() -> code.setExecute(true));
+			builder.setBytes("0x1000:0x0100", "9a 20 01 00 10");           // CALLF abort
+			builder.setBytes("0x1000:0x0120", "2e ff 2e 40 01");           // JMPF CS:[0x140]
+			builder.setBytes("0x1000:0x0130", "b8 01 4c cd 21");           // MOV AX,4C01; INT 21
+			builder.setBytes("0x1000:0x0140", "30 01 00 10");              // vector -> 1000:0130
+			builder.disassemble("0x1000:0x0100", 5, false);
+			builder.disassemble("0x1000:0x0120", 5, false);
+			builder.createFunction("0x1000:0x0120");
+			// The junk the disassembler decoded from the table behind the call, and the
+			// mark it left one byte past where it gave up.
+			builder.disassemble("0x1000:0x0105", 4, false);
+			Program program = builder.getProgram();
+			builder.withTransaction(() -> program.getBookmarkManager()
+					.setBookmark(builder.addr("0x1000:0x0109"), BookmarkType.ERROR,
+						Disassembler.ERROR_BOOKMARK_CATEGORY,
+						"Maximum run of repeated byte instructions exceeded " +
+							"(flow from 1000:0107)"));
+			ok = true;
+			return builder;
+		}
+		finally {
+			if (!ok) {
+				builder.dispose();
+			}
+		}
+	}
+
+	@Test
+	public void testFarJumpThroughCodeVectorIsFollowed() throws Exception {
+		ProgramBuilder builder = abortProgram();
+		try {
+			Program program = builder.getProgram();
+			assertNull("setup: the handler must start out undecoded",
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0130")));
+
+			assertEquals(1, resolveVectors(builder));
+
+			Instruction handler =
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0130"));
+			assertNotNull("the handler behind the vector must be disassembled", handler);
+			assertEquals("MOV", handler.getMnemonicString());
+			assertNotNull("and promoted to a function",
+				program.getFunctionManager().getFunctionAt(builder.addr("0x1000:0x0130")));
+			assertEquals("a second run must not re-resolve it", 0, resolveVectors(builder));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	@Test
+	public void testCallToTerminatingRoutineLosesItsFallThrough() throws Exception {
+		ProgramBuilder builder = abortProgram();
+		try {
+			Program program = builder.getProgram();
+			resolveVectors(builder); // the handler must exist before it can be judged
+
+			assertEquals(1, sealNonReturning(builder));
+
+			Instruction call =
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0100"));
+			assertEquals("a call that cannot return has no fall-through",
+				FlowOverride.CALL_RETURN, call.getFlowOverride());
+			assertNull(call.getFallThrough());
+			assertTrue("the abort routine is marked non-returning", program
+					.getFunctionManager()
+					.getFunctionAt(builder.addr("0x1000:0x0120"))
+					.hasNoReturn());
+			assertNull("and the table behind it is not decoded as code",
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0105")));
+			assertNull("the mark the abandoned run left behind must go too",
+				program.getBookmarkManager()
+						.getBookmark(builder.addr("0x1000:0x0109"), BookmarkType.ERROR,
+							Disassembler.ERROR_BOOKMARK_CATEGORY));
+			assertEquals("a second run must find nothing to seal", 0,
+				sealNonReturning(builder));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/**
+	 * The junk behind the abort is cleared even though the routine's own loads
+	 * reference it (those data references are what prove it is a table, not code) — but
+	 * the clear must stop dead at the first instruction something really flows to.
+	 */
+	@Test
+	public void testSealStopsAtCodeSomethingFlowsTo() throws Exception {
+		ProgramBuilder builder = abortProgram();
+		try {
+			Program program = builder.getProgram();
+			// A jump target immediately after the junk: real code, reached from
+			// elsewhere, sitting right where a runaway clear would reach it.
+			builder.setBytes("0x1000:0x0109", "cb");             // RETF at 0109
+			builder.setBytes("0x1000:0x0118", "eb ef");          // JMP 0109
+			builder.disassemble("0x1000:0x0118", 2, true);       // makes the flow ref
+			builder.disassemble("0x1000:0x0109", 1, true);       // and the code it reaches
+			resolveVectors(builder);
+
+			assertEquals(1, sealNonReturning(builder));
+
+			assertNull("the junk table is cleared",
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0105")));
+			assertNotNull("but the code the jump reaches is untouched",
+				program.getListing().getInstructionAt(builder.addr("0x1000:0x0109")));
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
+	/** A routine that plainly returns must never be taken for a terminating one. */
+	@Test
+	public void testOrdinaryCallKeepsItsFallThrough() throws Exception {
+		ProgramBuilder builder = new ProgramBuilder("RET", ProgramBuilder._X86_16_REAL_MODE);
+		try {
+			MemoryBlock code = builder.createMemory("CODE", "0x1000:0x0100", 0x30);
+			builder.withTransaction(() -> code.setExecute(true));
+			// CALLF 1000:0120; RETF   /   the callee: INT 21h (AH=9, print) then RETF
+			builder.setBytes("0x1000:0x0100", "9a 20 01 00 10 cb");
+			builder.setBytes("0x1000:0x0120", "b4 09 cd 21 cb");
+			builder.disassemble("0x1000:0x0100", 6, true);
+			builder.createFunction("0x1000:0x0120");
+
+			assertEquals("an INT 21h that is not 4Ch terminates nothing", 0,
+				sealNonReturning(builder));
+			Instruction call = builder.getProgram()
+					.getListing()
+					.getInstructionAt(builder.addr("0x1000:0x0100"));
+			assertEquals(FlowOverride.NONE, call.getFlowOverride());
+			assertNotNull("its fall-through stands", call.getFallThrough());
+		}
+		finally {
+			builder.dispose();
+		}
+	}
+
 	/**
 	 * An unresolved RTLink dispatch stub — {@code CALLF dispatcher; JMPF 0000:offset},
 	 * whose segment stays unrelocated until the overlay manager patches it at runtime —
