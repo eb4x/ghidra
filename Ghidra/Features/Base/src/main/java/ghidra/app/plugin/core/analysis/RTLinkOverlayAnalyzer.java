@@ -181,8 +181,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		if (isOverlayAnalyzed(program)) {
 			// Overlays were processed by a prior run; still retrofit what can be repaired
 			// in place on re-analysis so an already-analyzed program benefits without
-			// re-importing: re-wire dispatch-stub thunks (clearing stale no-return flags
-			// that silently truncate every caller's decompilation) and assume DS.
+			// re-importing: disassemble and rebuild "husk" functions whose code the old
+			// disassembler abandoned, re-wire dispatch-stub thunks (clearing stale
+			// no-return flags that silently truncate every caller's decompilation) and
+			// assume DS. Husks first, so the thunk pass finds real code at its targets.
+			repairHuskFunctions(program, log, monitor);
 			if (createStubXrefs) {
 				repairStubThunks(program, log, monitor);
 			}
@@ -898,6 +901,9 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 			new CreateFunctionCmd(overlayEntryPoints, SourceType.ANALYSIS);
 		funcCmd.applyTo(program, monitor);
 
+		verifyEntryPointsBecameCode(program, overlayEntryPoints, "overlay entry point", log,
+			monitor);
+
 		AddressSetView disassembled = disCmd.getDisassembledAddressSet();
 		long byteCount = disassembled == null ? 0 : disassembled.getNumAddresses();
 		Msg.debug(this, String.format(
@@ -1244,6 +1250,41 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		monitor.setMessage("RTLink: Creating trampoline target functions...");
 		CreateFunctionCmd funcCmd = new CreateFunctionCmd(targets, SourceType.ANALYSIS);
 		funcCmd.applyTo(program, monitor);
+
+		verifyEntryPointsBecameCode(program, targets, "trampoline target", log, monitor);
+	}
+
+	/**
+	 * Verify that every entry point in {@code entryPoints} was actually disassembled.
+	 * A seed the disassembler could not decode leaves {@link CreateFunctionCmd} to
+	 * plant a 1-byte function over the undefined bytes -- a husk that looks resolved
+	 * to every downstream consumer while hiding the failure. Tear such a husk down
+	 * and report the entry: no function at all is strictly better than a function
+	 * with no code.
+	 */
+	private static void verifyEntryPointsBecameCode(Program program, AddressSetView entryPoints,
+			String what, MessageLog log, TaskMonitor monitor) throws CancelledException {
+		Listing listing = program.getListing();
+		FunctionManager funcMgr = program.getFunctionManager();
+		for (Address entry : entryPoints.getAddresses(true)) {
+			monitor.checkCancelled();
+			if (listing.getInstructionAt(entry) != null) {
+				continue;
+			}
+			if (listing.getInstructionContaining(entry) != null) {
+				// Offcut into existing code, not undefined bytes: a pre-existing
+				// overlap the thunk pass reports on its own terms, not a silent
+				// disassembly failure.
+				continue;
+			}
+			Function husk = funcMgr.getFunctionAt(entry);
+			if (husk != null && !husk.isThunk()) {
+				funcMgr.removeFunction(entry);
+			}
+			log.appendMsg(String.format("RTLink: %s %s could not be disassembled%s", what,
+				entry, husk != null ? "; removed the 1-byte husk function created over it"
+						: "; no function created"));
+		}
 	}
 
 	/**
@@ -1339,20 +1380,27 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 
 		Function overlayFunc = funcMgr.getFunctionAt(targetAddr);
 		if (overlayFunc == null) {
-			try {
-				overlayFunc = funcMgr.createFunction(null, targetAddr,
-					new AddressSet(targetAddr, targetAddr), SourceType.ANALYSIS);
-			}
-			catch (Exception e) {
-				// The stub's overlay target is not (yet) a function and cannot be made
-				// one — e.g. the address holds defined data, or overlay disassembly has
-				// not reached it. Without a target there is nothing to thunk to, so the
-				// stub is left as-is. This used to return silently, hiding exactly the
-				// "stub never became a thunk, nothing logged" failures this pass exists
-				// to surface — so say so.
+			Program program = funcMgr.getProgram();
+			if (program.getListing().getInstructionAt(targetAddr) == null) {
+				// The stub's target never became code. Creating a function anyway
+				// would plant a 1-byte husk over undefined bytes -- worse than no
+				// function at all, because it looks resolved to every downstream
+				// consumer. Leave the stub unthunked and say so.
 				log.appendMsg(String.format(
-					"RTLink: could not create overlay target function at %s for stub %s: %s",
-					targetAddr, stubAddr, e.getMessage()));
+					"RTLink: no code at target %s for stub %s; stub left unthunked",
+					targetAddr, stubAddr));
+				return;
+			}
+			// The target is code but the bulk CreateFunctionCmd did not cover it
+			// (e.g. the repair path found a new stub). Create it with a real
+			// flow-computed body, never a fabricated 1-byte one.
+			new CreateFunctionCmd(targetAddr).applyTo(program);
+			overlayFunc = funcMgr.getFunctionAt(targetAddr);
+			if (overlayFunc == null) {
+				log.appendMsg(String.format(
+					"RTLink: could not create target function at %s for stub %s " +
+						"(target is likely inside another function's body)",
+					targetAddr, stubAddr));
 				return;
 			}
 		}
@@ -1460,6 +1508,107 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 				FAR_CALLING_CONVENTION, overlayFunc.getName(), overlayFunc.getEntryPoint(),
 				e.getMessage()));
 		}
+	}
+
+	/**
+	 * Find and repair "husk" functions: functions whose entry holds no instruction, so
+	 * their body collapsed to a single byte of undefined data. Programs analyzed before
+	 * the deferred-call-flow fix in {@code Disassembler} are full of them: a restricted
+	 * disassembly (the overlay pass) silently abandoned every pending call flow the
+	 * first time one landed outside the restriction, so intra-page near-call targets
+	 * were never disassembled, and every later {@code CreateFunctionCmd} on such a
+	 * target fabricated a 1-byte body over the undefined bytes.
+	 * <p>
+	 * Each husk entry is disassembled with unrestricted flow, its body recomputed, and
+	 * call targets newly exposed by that code are promoted to functions of their own.
+	 * Every husk found is counted; entries that still fail to disassemble are reported
+	 * in the analysis log with target and reason.
+	 */
+	private void repairHuskFunctions(Program program, MessageLog log, TaskMonitor monitor)
+			throws CancelledException {
+		Listing listing = program.getListing();
+		FunctionManager funcMgr = program.getFunctionManager();
+		Memory memory = program.getMemory();
+
+		List<Address> husks = new ArrayList<>();
+		for (Function function : funcMgr.getFunctions(true)) {
+			monitor.checkCancelled();
+			if (function.isThunk() || function.isExternal()) {
+				continue;
+			}
+			Address entry = function.getEntryPoint();
+			MemoryBlock block = memory.getBlock(entry);
+			if (block == null || !block.isExecute() || !block.isInitialized()) {
+				continue;
+			}
+			if (listing.getInstructionAt(entry) == null &&
+				listing.getInstructionContaining(entry) == null) {
+				husks.add(entry);
+				Msg.debug(this, "RTLink: husk function (no code at entry) " +
+					function.getName() + " at " + entry);
+			}
+		}
+		if (husks.isEmpty()) {
+			return;
+		}
+
+		monitor.setMessage("RTLink: Repairing husk functions...");
+		AddressSet repaired = new AddressSet();
+		AddressSet newCode = new AddressSet();
+		int failed = 0;
+		for (Address entry : husks) {
+			monitor.checkCancelled();
+			DisassembleCommand disCmd = new DisassembleCommand(entry, null, true);
+			disCmd.applyTo(program, monitor);
+			if (listing.getInstructionAt(entry) == null) {
+				log.appendMsg(String.format(
+					"RTLink: husk function at %s could not be repaired: %s", entry,
+					disCmd.getStatusMsg()));
+				failed++;
+				continue;
+			}
+			repaired.add(entry);
+			AddressSetView disassembled = disCmd.getDisassembledAddressSet();
+			if (disassembled != null) {
+				newCode.add(disassembled);
+			}
+		}
+
+		// The repair exposed new code; promote its call targets to functions so the
+		// husk's callees (reachable only through it) become functions too.
+		AddressSet callTargets = new AddressSet();
+		ReferenceManager refMgr = program.getReferenceManager();
+		AddressIterator sources = refMgr.getReferenceSourceIterator(newCode, true);
+		while (sources.hasNext()) {
+			monitor.checkCancelled();
+			for (Reference ref : refMgr.getReferencesFrom(sources.next())) {
+				Address target = ref.getToAddress();
+				if (ref.getReferenceType().isCall() &&
+					listing.getInstructionAt(target) != null &&
+					funcMgr.getFunctionAt(target) == null) {
+					callTargets.add(target);
+				}
+			}
+		}
+		if (!callTargets.isEmpty()) {
+			new CreateFunctionCmd(callTargets, SourceType.ANALYSIS).applyTo(program, monitor);
+		}
+
+		// Recompute each repaired function's body from its now-real flow.
+		for (Address entry : repaired.getAddresses(true)) {
+			monitor.checkCancelled();
+			CreateFunctionCmd.fixupFunctionBody(program, listing.getInstructionAt(entry),
+				monitor);
+		}
+
+		// Msg.info only, never log.appendMsg: this is a clean-run success count, and any
+		// content in the analysis MessageLog pops the warnings dialog. The failures above
+		// did go to the MessageLog -- those are genuine.
+		Msg.info(this, String.format(
+			"RTLink: Repaired %d husk function(s) (no code at entry), " +
+				"%d new function(s) at exposed call targets%s",
+			repaired.getNumAddresses(), callTargets.getNumAddresses(),
+			failed > 0 ? ", " + failed + " unrepairable" : ""));
 	}
 
 	/**
