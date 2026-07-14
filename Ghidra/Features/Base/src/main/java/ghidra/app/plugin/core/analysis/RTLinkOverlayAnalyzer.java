@@ -17,6 +17,7 @@ package ghidra.app.plugin.core.analysis;
 
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -128,6 +129,26 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 	// treated as a dispatcher, replacing the old hardcoded 0x0DAB dispatch offset
 	// so the analyzer adapts to binaries linked with the dispatcher elsewhere.
 	private static final int MIN_DISPATCHER_STUB_COUNT = 4;
+
+	/**
+	 * The overlay manager's relocation fixup loop — a byte-identical blob the linker stamps
+	 * into every VM program (see the "Fingerprint" section of {@code docs/rtlink-format.md}).
+	 * Used here only to locate the code segment the manager lives in.
+	 */
+	private static final byte[] RUNTIME_FIXUP_FINGERPRINT = {
+		(byte) 0xe3, 0x19, 0x06, 0x57, (byte) 0xd1, (byte) 0xe6, (byte) 0xd1, (byte) 0xe6,
+		(byte) 0xad, (byte) 0x8b, (byte) 0xf8, (byte) 0xad, 0x03, (byte) 0xc3, (byte) 0x8e,
+		(byte) 0xc0, 0x26, 0x01, 0x15, (byte) 0xe2, (byte) 0xf3, (byte) 0xd1, (byte) 0xee,
+		(byte) 0xd1, (byte) 0xee, 0x5f, 0x07, (byte) 0xc3
+	};
+
+	/**
+	 * The error text the RTLink support code carries in its own code segment. It is what
+	 * marks a binary as RTLink at all, and it is present even in section-only binaries that
+	 * have no VM manager (and so no {@link #RUNTIME_FIXUP_FINGERPRINT}).
+	 */
+	private static final byte[] RUNTIME_SIGNATURE =
+		"Internal error in .RTLink(R)/Plus run-time code.".getBytes(StandardCharsets.US_ASCII);
 
 	private static final String OPTION_APPLY_RELOCS = "Apply Relocations";
 	private static final String OPTION_CREATE_XREFS = "Create Stub Cross-References";
@@ -410,10 +431,11 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		}
 		ProgramContext context = program.getProgramContext();
 		BigInteger value = BigInteger.valueOf(dgroup & 0xffffL);
+		Set<MemoryBlock> runtime = findRuntimeCodeBlocks(program, dgroup);
 		int blocks = 0;
 		try {
 			for (MemoryBlock block : program.getMemory().getBlocks()) {
-				if (block.isExecute()) {
+				if (block.isExecute() && !runtime.contains(block)) {
 					context.setValue(ds, block.getStart(), block.getEnd(), value);
 					blocks++;
 				}
@@ -428,7 +450,54 @@ public class RTLinkOverlayAnalyzer extends AbstractAnalyzer {
 		// AutoAnalysisPlugin.analysisEnded() pop a "There were warnings/errors issued during
 		// analysis" dialog. The MessageLog above is for the paths where DS could not be assumed.
 		Msg.info(this, String.format(
-			"RTLink: Assuming DS = 0x%04X (DGROUP) over %d executable blocks", dgroup, blocks));
+			"RTLink: Assuming DS = 0x%04X (DGROUP) over %d executable blocks; skipped %d " +
+				"RTLink runtime block(s), where DS is not DGROUP",
+			dgroup, blocks, runtime.size()));
+	}
+
+	/**
+	 * The executable blocks holding the RTLink runtime, where {@code DS != DGROUP}.
+	 *
+	 * <p>The runtime is hand-written assembly, not compiler output, and it owns DS: the
+	 * overlay manager reloads it constantly from its own saved-segment slots (in VICEROY.EXE,
+	 * {@code MOV DS,word ptr CS:[0x39a1]} and friends throughout segment {@code 210d}, and
+	 * {@code MOV DS,CS} in its error paths), while the support code addresses every one of
+	 * its variables CS-relative and never loads DS at all. Assuming DGROUP over either is
+	 * simply false.
+	 *
+	 * <p>It is also not harmless. {@link RTLinkXrefAnalyzer} keys both its DS-relative
+	 * data pass and its address-of-immediate pass off this context, so a {@code MOV BX,0x44a7}
+	 * naming a string inside the manager's own segment became a data reference to
+	 * {@code DGROUP:44a7} — a bogus label on an unrelated game global. Leaving DS unset here
+	 * makes that pass skip the runtime entirely, which is the honest answer: we do not know
+	 * what DS holds at an arbitrary point in it.
+	 *
+	 * <p>Both halves of the runtime carry a documented signature (docs/rtlink-format.md): the
+	 * VM manager the fixup-loop fingerprint, the support code the RTLink error text. DGROUP's
+	 * own block is never disowned, however those signatures happen to fall.
+	 *
+	 * <p>Package-private so tests can drive it directly.
+	 */
+	static Set<MemoryBlock> findRuntimeCodeBlocks(Program program, int dgroup) {
+		Memory memory = program.getMemory();
+		Set<MemoryBlock> runtime = new HashSet<>();
+		for (byte[] signature : List.of(RUNTIME_FIXUP_FINGERPRINT, RUNTIME_SIGNATURE)) {
+			Address hit = memory.findBytes(memory.getMinAddress(), signature, null, true,
+				TaskMonitor.DUMMY);
+			if (hit == null) {
+				continue;
+			}
+			MemoryBlock block = memory.getBlock(hit);
+			if (block == null || !block.isExecute()) {
+				continue;
+			}
+			if (block.getStart() instanceof SegmentedAddress start &&
+				start.getSegment() == dgroup) {
+				continue;
+			}
+			runtime.add(block);
+		}
+		return runtime;
 	}
 
 	private static Address firstEntryPoint(Program program) {

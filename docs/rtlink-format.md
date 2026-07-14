@@ -506,7 +506,52 @@ and not one). All live in
 
 Tests: `RTLinkPageHeaderTest` (header shapes incl. VMEX2's CODEVIEW word),
 `RTLinkOverlayRelocationTest` (pins both deltas hermetically — commit `82f65916ff`),
-`RTLinkAddressOfXrefTest`.
+`RTLinkAddressOfXrefTest`, `RTLinkRuntimeDataSegmentTest`.
+
+### The runtime owns DS — the assumption does not reach it
+
+`RTLinkOverlayAnalyzer` detects DGROUP from the C startup and assumes `DS = DGROUP`, which is
+what makes DS-relative globals resolve at all. **That assumption is a property of
+compiler-generated code, and the RTLink runtime is not compiler-generated.** The runtime
+manages DS itself:
+
+- The **VM manager** (VICEROY `210d`) reloads DS constantly from its own saved-segment slots
+  — `MOV DS,word ptr CS:[0x3999]`, `CS:[0x39a1]`, `CS:[0x39a5]` — and does `MOV DS,CS` in its
+  error paths, e.g. at `210d:4454`:
+
+  ```
+  mov dx,cs
+  mov ds,dx           ; DS = CS = 210d, not DGROUP
+  mov bx,0x44a7       ; -> 210d:44a7, its own message text
+  ```
+
+- The **support code** (VICEROY `275d`) is entirely CS-relative (`cs:0x65e`, `cs:[bx]`,
+  `cs:0x713`) and never loads DS at all.
+
+Assuming DGROUP over either is simply false, and it is *not* harmless: `RTLinkXrefAnalyzer`
+keys both its DS-relative pass and its address-of-immediate pass off this context, so the
+`MOV BX,0x44a7` above became a data reference to `DGROUP:44a7` — a bogus `DAT_2b5a_44a7`
+label on an unrelated game global. On VICEROY that was **103 references over 19 globals**,
+and the noise is worst where it is least visible: a stray label inside a real array (the unit
+array at `2b5a:3144`) reads as evidence that the array ends there.
+
+So the DS assumption now **skips the runtime's code blocks**, leaving DS unset there — the
+honest answer, since we do not know what DS holds at an arbitrary point in it. Both halves
+are found by signatures this document already relies on: the VM manager by the
+[fixup-loop fingerprint](#fingerprint), the support code by the RTLink error text from
+[Identification](#identification) (present even in section-only binaries, which have no VM
+manager and so no fingerprint). DGROUP's own block is never disowned, however those
+signatures fall.
+
+Measured on a fresh VICEROY import: DS assumed over 134 blocks, 2 runtime blocks skipped;
+the false references and all 38 `2b5a:4xxx` labels gone; real DGROUP xrefs unchanged
+(`colony_count` 62, the unit array 155, the player array 29), switch tables unchanged
+(38 + 1 → 39 overrides), function count unchanged (2951).
+
+A DB analyzed before this fix keeps the stale DS *context* in its runtime blocks (the
+`RTLink Data Segment Assumed` flag gates the retrofit, and nothing clears an existing
+context), so the runtime still decompiles with phantom DGROUP globals there. Re-import to
+clear it; the references themselves can be deleted in place.
 
 ### The DS-relative jump table
 
