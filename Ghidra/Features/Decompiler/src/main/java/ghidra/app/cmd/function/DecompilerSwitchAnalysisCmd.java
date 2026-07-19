@@ -180,17 +180,15 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 
 		Listing listing = program.getListing();
 		Address[] cases = table.getCases();
-		Integer[] caseValues = table.getLabelValues();
 		AddressSet disSetList = new AddressSet();
 
 		for (int caseIndex = 0; caseIndex < cases.length; caseIndex++) {
 			Address caseStart = cases[caseIndex];
 			monitor.checkCancelled();
-			
-			if (!isDefaultCase(caseValues, caseIndex)) {
-				// only non-default cases should be added to the switching instruction
-				instr.addMnemonicReference(caseStart, flowType, SourceType.ANALYSIS);
-			}
+
+			// all cases, including the default case, are added to the switching instruction
+			// so that any code disassembled below is reached by a reference
+			instr.addMnemonicReference(caseStart, flowType, SourceType.ANALYSIS);
 
 			// if conflict skip case
 			if (listing.getUndefinedDataAt(caseStart) == null) {
@@ -224,9 +222,6 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 	 * A case is default if it is first case to not have a case value, or has a magic case value.
 	 * It is possible that there could be more than one case without a value.  The code shouldn't
 	 * blow up if this is the case.
-	 * 
-	 * TODO: Should this check if the default case already has a reference to it
-	 *       from a conditional jump?
 	 */
 	private boolean isDefaultCase(Integer[] caseValues, int caseIndex) {
 		return (caseIndex == caseValues.length) ||
@@ -234,8 +229,8 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 	}
 
 	/*
-	 * Check if the switching instruction has all switch references already.
-	 * Extra check for default case target as part of the table, when it shouldn't be.
+	 * Check if the switching instruction has all switch references already,
+	 * including a reference to the default case target.
 	 */
 	public boolean hasAllReferences(TaskMonitor monitor, JumpTable table, Instruction instr,
 			Function containingFunction) throws CancelledException {
@@ -244,15 +239,11 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 
 		Reference[] referencesFrom = instr.getReferencesFrom();
 		Address[] tableDest = table.getCases();
-		Integer[] caseValues = table.getLabelValues();
 
-		// check that all cases are already a reference on the instruction, except default
+		// check that all cases are already a reference on the instruction
 		for (int caseIndex = 0; caseIndex < tableDest.length; caseIndex++) {
 			monitor.checkCancelled();
-			
-			// a case is default if it is first case to not have a value, or has a magic case value
-			boolean isDefaultCase = isDefaultCase(caseValues, caseIndex);
-			
+
 			if (containingBody != null && !containingBody.contains(tableDest[caseIndex])) {
 				// switch case missing from owner function's body
 				return false;
@@ -265,17 +256,11 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 					break;
 				}
 			}
-			if (isDefaultCase) {
-				// default case should not be on switching instruction
-				if (foundit) {
-					return false;
-				}
-			}
-			else if (!foundit) {
+			if (!foundit) {
 				return false;
 			}
 		}
-		
+
 		return true;
 	}
 

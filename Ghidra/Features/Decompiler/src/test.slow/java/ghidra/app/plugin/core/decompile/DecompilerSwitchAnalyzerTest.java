@@ -26,6 +26,7 @@ import ghidra.program.database.ProgramBuilder;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.util.task.TaskMonitor;
@@ -151,7 +152,7 @@ public class DecompilerSwitchAnalyzerTest extends AbstractGenericTest {
 		Instruction instr = listing.getInstructionAt(addr("0x001011a7"));
 		assertNoOperandReference(0, instr);
 		assertNoOperandReference(1, instr);
-		assertNumMnemonicReferences(instr, 10);
+		assertNumMnemonicReferences(instr, 11);
 		assertMnemonicReferenceTo(instr, addr("0x001011aa"));
 		assertMnemonicReferenceTo(instr, addr("0x001011be"));
 		assertMnemonicReferenceTo(instr, addr("0x001011d2"));
@@ -162,7 +163,18 @@ public class DecompilerSwitchAnalyzerTest extends AbstractGenericTest {
 		assertMnemonicReferenceTo(instr, addr("0x0010122a"));
 		assertMnemonicReferenceTo(instr, addr("0x0010123b"));
 		assertMnemonicReferenceTo(instr, addr("0x0010124c"));
-		
+
+		// the default case gets a reference too, with the same flow type as the other cases
+		assertMnemonicReferenceTo(instr, addr("0x0010125d"));
+		for (Reference reference : instr.getMnemonicReferences()) {
+			assertEquals("Switch case flow type " + reference.getToAddress(),
+				RefType.COMPUTED_JUMP, reference.getReferenceType());
+		}
+
+		// re-running the analyzer must be stable: all references, default included,
+		// are already in place
+		analyze(addressSet);
+		assertNumMnemonicReferences(instr, 11);
 	}
 	
 	private void assertNoOperandReference(int opIndex, Instruction instr) {
