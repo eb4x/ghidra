@@ -16,15 +16,17 @@
 	<float_size value="4" />
 	<double_size value="8" />
 	<long_double_size value="10" />
-	<!-- alignment varies between MIcrosoft and Borland -->
-	<!--
+	<!-- 16-bit compilers align to at most a 2-byte (word) boundary: the stack is
+	     2-byte granular, and Microsoft C packs structures at 2 bytes by default
+	     (/Zp2) while Borland packs at 1 (-a-).  Without this map the default
+	     4/8-byte alignments apply, padding stack parameters larger than 2 bytes
+	     onto 4-byte boundaries no 16-bit compiler uses. -->
 	<size_alignment_map>
 		<entry size="1" alignment="1" />
 		<entry size="2" alignment="2" />
 		<entry size="4" alignment="2" />
 		<entry size="8" alignment="2" />
 	</size_alignment_map>
-	-->
   </data_organization>
   
   <global>
