@@ -15,8 +15,8 @@ extension, each tracked as an upstream PR:
 
 plus a DNM commit for the flatpak/HiDPI launch flags and this file. **No RTLink
 analyzer code lives in this tree** — that is now the standalone extension at
-`~/src/ghidra-rtlink-plugin` (see its CLAUDE.md; installed into the running Ghidra as
-an extension, alongside the MCP server from `~/src/ebbex-ghidra-mcp`).
+`~/src/ghidra-plugin-rtlink` (see its CLAUDE.md; installed into the running Ghidra as
+an extension, alongside the MCP server from `~/src/ghidra-plugin-mcp`).
 
 The repo is a bare checkout at `..` with one directory per worktree. Current layout:
 `dailydriver` (this one — loaded into Eclipse, runs the daily Ghidra), `master`
@@ -29,7 +29,7 @@ Each of the five fixes exists twice: as a PR branch off origin/master, and cherr
 here onto the release tag. **When a PR gets review feedback, update both.**
 
 RE-side documentation (workflow, symbol map, findings) lives in `../../viceroy/docs/`;
-the RTLink overlay format reference is `~/src/ghidra-rtlink-plugin/docs/rtlink-format.md`.
+the RTLink overlay format reference is `~/src/ghidra-plugin-rtlink/docs/rtlink-format.md`.
 
 ## Build commands
 
@@ -62,7 +62,7 @@ extensions installed into its `Extensions/` dir (via each extension repo's
 extension, exposing the `ghidra-application-level` and `ghidra-program` tools for the
 running instance.
 
-The two extension repos (`~/src/ghidra-rtlink-plugin`, `~/src/ebbex-ghidra-mcp`) are
+The two extension repos (`~/src/ghidra-plugin-rtlink`, `~/src/ghidra-plugin-mcp`) are
 **not** in the Eclipse workspace — edit them directly on the filesystem and build with
 their own `./gradlew`.
 
