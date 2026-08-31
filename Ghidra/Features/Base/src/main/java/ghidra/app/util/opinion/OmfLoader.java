@@ -20,12 +20,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 import ghidra.app.util.MemoryBlockUtils;
+import ghidra.app.util.Option;
 import ghidra.app.util.bin.BinaryReader;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.format.omf.*;
 import ghidra.app.util.bin.format.omf.omf.*;
 import ghidra.app.util.bin.format.omf.omf.OmfFixupRecord.Subrecord;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.framework.model.DomainObject;
 import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.*;
@@ -49,6 +51,10 @@ public class OmfLoader extends AbstractProgramWrapperLoader {
 	public final static long MIN_BYTE_LENGTH = 11;
 	public final static long IMAGE_BASE = 0x2000; // Base offset to start loading segments
 	public final static long MAX_UNINITIALIZED_FILL = 0x2000;	// Maximum zero bytes added to pad initialized segments
+
+	public static final String UNKNOWN_CLASS_IS_CODE_OPTION_NAME =
+		"Treat segments of unrecognized class as code";
+	static final boolean UNKNOWN_CLASS_IS_CODE_OPTION_DEFAULT = true;
 
 	private List<OmfSymbol> externsyms = new ArrayList<>();
 
@@ -108,6 +114,28 @@ public class OmfLoader extends AbstractProgramWrapperLoader {
 	}
 
 	@Override
+	public List<Option> getDefaultOptions(ByteProvider provider, LoadSpec loadSpec,
+			DomainObject domainObject, boolean loadIntoProgram, boolean mirrorFsLayout) {
+		List<Option> list = super.getDefaultOptions(provider, loadSpec, domainObject,
+			loadIntoProgram, mirrorFsLayout);
+		list.add(new Option(UNKNOWN_CLASS_IS_CODE_OPTION_NAME,
+			UNKNOWN_CLASS_IS_CODE_OPTION_DEFAULT));
+		return list;
+	}
+
+	private boolean unknownClassIsCode(List<Option> options) {
+		boolean unknownClassIsCode = UNKNOWN_CLASS_IS_CODE_OPTION_DEFAULT;
+		if (options != null) {
+			for (Option option : options) {
+				if (option.getName().equals(UNKNOWN_CLASS_IS_CODE_OPTION_NAME)) {
+					unknownClassIsCode = (Boolean) option.getValue();
+				}
+			}
+		}
+		return unknownClassIsCode;
+	}
+
+	@Override
 	protected void load(Program program, ImporterSettings settings)
 			throws IOException, CancelledException {
 		MessageLog log = settings.log();
@@ -116,7 +144,7 @@ public class OmfLoader extends AbstractProgramWrapperLoader {
 		AbstractOmfRecordFactory factory = new OmfRecordFactory(settings.provider());
 		try {
 			header = OmfFileHeader.parse(factory, monitor, log);
-			header.resolveNames();
+			header.resolveNames(unknownClassIsCode(settings.options()));
 			header.sortSegmentDataBlocks();
 			OmfFileHeader.doLinking(IMAGE_BASE, header.getSegments(), header.getGroups());
 		}
