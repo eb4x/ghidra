@@ -42,7 +42,7 @@ public class OmfFileHeader extends OmfRecord {
 	private List<OmfFixupRecord> fixup = new ArrayList<>();
 	private List<OmfSegmentHeader> extraSeg = null;    // Holds implied segments that don't have official header record
 	//	private OmfModuleEnd endModule = null;
-	private boolean format16bit;
+	private boolean format16bit = true;	// 16-bit unless a segment definition says otherwise
 
 	public OmfFileHeader(BinaryReader reader) throws IOException {
 		super(reader);
