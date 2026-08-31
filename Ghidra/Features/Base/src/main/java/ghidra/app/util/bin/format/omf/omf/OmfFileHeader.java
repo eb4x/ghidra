@@ -224,8 +224,20 @@ public class OmfFileHeader extends OmfRecord {
 	 * @throws OmfException if any name indices are malformed
 	 */
 	public void resolveNames() throws OmfException {
+		resolveNames(true);
+	}
+
+	/**
+	 * Resolve special names associated with each segment: segment, class, overlay names
+	 * and group: group name
+	 * For each segment, the read/write/execute permissions are also determined
+	 * @param unknownClassIsCode true if a segment whose class name is unrecognized should be
+	 *   marked executable
+	 * @throws OmfException if any name indices are malformed
+	 */
+	public void resolveNames(boolean unknownClassIsCode) throws OmfException {
 		for (int i = 0; i < segments.size(); ++i) {
-			segments.get(i).resolveNames(nameList);
+			segments.get(i).resolveNames(nameList, unknownClassIsCode);
 		}
 		// extraSeg segments already have names
 		for (int i = 0; i < groups.size(); ++i) {

@@ -287,13 +287,24 @@ public class OmfSegmentHeader extends OmfRecord {
 	}
 
 	/**
+	 * Class names that conventionally hold data.  Segment classes not recognized as either
+	 * code or data are given both write and execute permission, as some linkers assign each
+	 * segment its own class name, telling us nothing about what the segment holds.
+	 */
+	private static final Set<String> DATA_CLASS_NAMES = Set.of("DATA", "BSS", "CONST", "STACK",
+		"BEGDATA", "FAR_DATA", "FAR_BSS", "MSG", "FAR_MSG", "DEBSYM", "DEBTYP");
+
+	/**
 	 * Resolve special names from the name list such as: segment, class, overlay, names.
 	 * This routine also determines the read/write/execute permissions for the segment
 	 * based on the class name.
 	 * @param nameList is the array of names associated with the file
+	 * @param unknownClassIsCode true if a segment whose class name is unrecognized should be
+	 *   marked executable
 	 * @throws OmfException for improper name indices
 	 */
-	protected void resolveNames(List<String> nameList) throws OmfException {
+	protected void resolveNames(List<String> nameList, boolean unknownClassIsCode)
+			throws OmfException {
 		if (segmentNameIndex.value() == 0) {
 			segmentName = "";			// Name is unused
 		}
@@ -324,15 +335,24 @@ public class OmfSegmentHeader extends OmfRecord {
 
 		// Once we know the class name, we can make some educated guesses about read/write/exec permissions
 		isReadable = true;
-		if (className.equals("CODE") || className.equals("code")) {
+		String upperClassName = className.toUpperCase();
+		if (upperClassName.contains("CODE") || upperClassName.endsWith("TEXT")) {
 			isCode = true;
 			isWritable = false;
 			isExecutable = true;
 		}
-		else {
+		else if (DATA_CLASS_NAMES.contains(upperClassName)) {
 			isCode = false;
 			isWritable = true;
 			isExecutable = false;
+		}
+		else {
+			// The class name follows no convention we know.  The segment may hold either
+			// code or data, so (optionally) keep it both writable and executable rather
+			// than hide code from analysis or let the decompiler treat data as constant.
+			isCode = unknownClassIsCode;
+			isWritable = true;
+			isExecutable = unknownClassIsCode;
 		}
 	}
 
