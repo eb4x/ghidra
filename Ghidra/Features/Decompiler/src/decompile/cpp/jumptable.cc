@@ -1077,7 +1077,8 @@ void JumpBasic::analyzeGuards(BlockBasic *bl,int4 pathout)
 {
   int4 i,j,indpath;
   int4 maxbranch = 2;		// Maximum number of CBRANCHs to consider
-  int4 maxpullback = 2;
+  int4 maxpullback = 4;		// A flag held as a bit-field of a status register is tested
+				// as sless(flag << n, 0), a comparison buried 3 ops deep
   bool usenzmask = !jumptable->isPartial();
 
   selectguards.clear();
