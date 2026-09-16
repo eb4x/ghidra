@@ -641,6 +641,64 @@ TEST(circlerange_pullbacksright4) {
   ASSERT(!valid);
 }
 
+TEST(circlerange_pullbackleft1) {
+  // A carry flag held as bit 7 of an 8-bit status register, tested as sless(flag << 7, 0)
+  CircleRange range(0x80, 0x00, 1, 0x80);
+  bool valid = range.pullBackShiftLeft(7, 1, 1);
+  ASSERT(valid);
+  ASSERT_EQUALS(range.getMin(), 1);
+  ASSERT_EQUALS(range.getEnd(), 2);
+}
+
+TEST(circlerange_pullbackleft2) {
+  CircleRange range(0x00, 0x80, 1, 1);
+  bool valid = range.pullBackShiftLeft(7, 1, 1);
+  ASSERT(valid);
+  ASSERT_EQUALS(range.getMin(), 0);
+  ASSERT_EQUALS(range.getEnd(), 1);
+}
+
+TEST(circlerange_pullbackleft3) {
+  CircleRange range(0x0300, 0x0a00, 2, 1);
+  bool valid = range.pullBackShiftLeft(8, 0xff, 2);
+  ASSERT(valid);
+  ASSERT_EQUALS(range.getMin(), 3);
+  ASSERT_EQUALS(range.getEnd(), 10);
+}
+
+TEST(circlerange_pullbackleft4) {
+  // Boundaries between achievable outputs round up to the next one
+  CircleRange range(0x21, 0x5f, 1, 1);
+  bool valid = range.pullBackShiftLeft(4, 0x0f, 1);
+  ASSERT(valid);
+  ASSERT_EQUALS(range.getMin(), 3);
+  ASSERT_EQUALS(range.getEnd(), 6);
+}
+
+TEST(circlerange_pullbackleft5) {
+  // Wrapping output range whose pre-image does not wrap
+  CircleRange range(0x81, 0x40, 1, 1);
+  bool valid = range.pullBackShiftLeft(7, 1, 1);
+  ASSERT(valid);
+  ASSERT_EQUALS(range.getMin(), 0);
+  ASSERT_EQUALS(range.getEnd(), 1);
+}
+
+TEST(circlerange_pullbackleft6) {
+  // A bit that would be shifted away may be set: refuse, leaving the range untouched
+  CircleRange range(0x80, 0x00, 1, 1);
+  bool valid = range.pullBackShiftLeft(7, 3, 1);
+  ASSERT(!valid);
+  ASSERT_EQUALS(range.getMin(), 0x80);
+  ASSERT_EQUALS(range.getEnd(), 0);
+}
+
+TEST(circlerange_pullbackleft7) {
+  CircleRange range(0x80, 0x00, 1, 1);
+  ASSERT(!range.pullBackShiftLeft(0, 1, 1));
+  ASSERT(!range.pullBackShiftLeft(8, 1, 1));
+}
+
 TEST(circlerange_pullbackequal1) {
   CircleRange range(true);
   bool valid = range.pullBackBinary(CPUI_INT_EQUAL, 0x1234, 0, 4, 1);
