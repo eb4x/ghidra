@@ -1002,6 +1002,47 @@ bool CircleRange::pullBackBinary(OpCode opc,uintb val,int4 slot,int4 inSize,int4
   return true;
 }
 
+/// \brief Pull-back \b this range through a CPUI_INT_LEFT by a constant, over a known-narrow input
+///
+/// The operation is `out = (in << sa)`, which discards the most significant \e sa bits of the
+/// input, so in general one output has many pre-images and no CircleRange can express them.  If the
+/// input's non-zero mask shows the discarded bits are already zero, the input lives in the narrow
+/// domain [0, 2^(size-sa)), the shift is injective there, and each boundary maps to the smallest
+/// input whose image reaches it (rounding \e up to the next achievable output).  The result is exact
+/// whenever the pre-image is a plain interval of that domain, which covers the single-bit flag case
+/// this exists for.  Otherwise, a pre-image that wraps within the domain, a range with a stride
+/// (treated as the interval spanning it), or a range containing no achievable output (whose
+/// boundaries collide into the full set) all yield a superset, which is safe for a caller narrowing
+/// a guard.
+/// \param sa is the constant number of bits shifted
+/// \param inNzMask is the non-zero mask of the input Varnode
+/// \param inSize is the storage size of the input (and output) Varnode in bytes
+/// \return \b true if the pull-back was successful, \b false if \b this is unchanged
+bool CircleRange::pullBackShiftLeft(uintb sa,uintb inNzMask,int4 inSize)
+
+{
+  if (isempty) return false;
+  if (sa == 0 || sa >= 8*inSize) return false;
+  uintb newMask = calc_mask(inSize);
+  uintb survives = newMask >> sa;		// Input bits that are not shifted away
+  if ((inNzMask & ~survives) != 0)
+    return false;				// A discarded bit might be set: pre-image is not an interval
+  uintb blockMask = (((uintb)1) << sa) - 1;	// Spacing of achievable outputs, minus one
+  uintb newLeft = (left >> sa) + (((left & blockMask) != 0) ? 1 : 0);
+  if (newLeft > survives)
+    newLeft = 0;				// No achievable output at or past left: resume at 0
+  uintb newRight;
+  if (right == 0)
+    newRight = survives + 1;			// The end of the output domain is the end of the narrow one
+  else
+    newRight = (right >> sa) + (((right & blockMask) != 0) ? 1 : 0);
+  mask = newMask;
+  left = newLeft;
+  right = newRight;
+  step = 1;
+  return true;
+}
+
 /// The pull-back is performed through a given p-code \b op and set \b this
 /// to the resulting range (if possible).
 /// If there is a single unknown input, and the set of values
@@ -1050,7 +1091,14 @@ Varnode *CircleRange::pullBack(PcodeOp *op,Varnode **constMarkup,bool usenzmask)
     val = constvn->getOffset();
     OpCode opc = op->code();
     if (!pullBackBinary(opc, val, slot, res->getSize(), op->getOut()->getSize())) {
-      if (usenzmask && opc == CPUI_SUBPIECE && val == 0) {
+      if (usenzmask && opc == CPUI_INT_LEFT && slot == 0) {
+	// Not invertible in general, but it is over an input whose top bits are known zero.
+	// A flag held as a bit-field of a status register is tested by shifting it into
+	// place, so a guard on such a flag can only be seen through this form.
+	if (!pullBackShiftLeft(val, res->getNZMask(), res->getSize()))
+	  return (Varnode *) 0;
+      }
+      else if (usenzmask && opc == CPUI_SUBPIECE && val == 0) {
 	// If everything we are truncating is known to be zero, we may still have a range
 	int4 msbset = mostsigbit_set(res->getNZMask());
 	msbset = (msbset + 8) / 8;
