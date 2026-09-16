@@ -88,6 +88,7 @@ public:
   bool minimalContainer(const CircleRange &op2,int4 maxStep);	///< Construct minimal range that contains both \b this and another range
   int4 invert(void);				///< Convert to complementary range
   void setStride(int4 newStep,uintb rem);	///< Set a new step on \b this range.
+  bool pullBackShiftLeft(uintb sa,uintb inNzMask,int4 inSize);	///< Pull-back \b this through a left shift of a known-narrow value
   bool pullBackUnary(OpCode opc,int4 inSize,int4 outSize);	///< Pull-back \b this through the given unary operator
   bool pullBackBinary(OpCode opc,uintb val,int4 slot,int4 inSize,int4 outSize);	///< Pull-back \b this thru binary operator
   Varnode *pullBack(PcodeOp *op,Varnode **constMarkup,bool usenzmask);	///< Pull-back \b this range through given PcodeOp.
