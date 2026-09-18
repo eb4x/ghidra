@@ -112,20 +112,23 @@ public class CodeUnitFormat {
 	public String getRepresentationString(CodeUnit cu, boolean includeEOLcomment) {
 
 		StringBuilder stringBuffer = new StringBuilder(getMnemonicRepresentation(cu));
-		if (cu instanceof Instruction) {
-			Instruction instr = (Instruction) cu;
+		if (cu instanceof Instruction instr) {
 			int n = instr.getNumOperands();
+			// Separator 0 is the text before the first operand and separator n the text after
+			// the last, so a language which brackets an operand needs both of them emitted.
+			String separator = instr.getSeparator(0);
+			if (separator != null || n != 0) {
+				stringBuffer.append(" ");
+			}
+			if (separator != null) {
+				stringBuffer.append(separator);
+			}
 			for (int i = 0; i < n; i++) {
-				if (i == 0) {
-					stringBuffer.append(" ");
-				}
-				else {
-					String separator = instr.getSeparator(i);
-					if (separator != null && separator.length() != 0) {
-						stringBuffer.append(separator);
-					}
-				}
 				stringBuffer.append(getOperandRepresentationString(cu, i));
+				separator = instr.getSeparator(i + 1);
+				if (separator != null) {
+					stringBuffer.append(separator);
+				}
 			}
 		}
 		else {
