@@ -9004,10 +9004,96 @@ Varnode *RuleSignMod2nOpt2::checkMultiequalForm(PcodeOp *op,uintb npow)
 
 /// \class RuleSegment
 /// \brief Propagate constants through a SEGMENTOP
+///
+/// If both base and inner are constant, the SEGMENTOP becomes the constant address.
+/// If only the base is constant and differs from the default (near) segment, the
+/// SEGMENTOP becomes the far pointer `zext(inner) + (base << innerbits)`, so the access
+/// keeps its segment.
 void RuleSegment::getOpList(vector<uint4> &oplist) const
 
 {
   oplist.push_back(CPUI_SEGMENTOP);
+}
+
+/// \brief Does the given Varnode derive from a stack pointer?
+///
+/// RuleLoadVarnode recognizes stack accesses by the inner offset alone and ignores the
+/// segment, so a stack-relative inner must be left inside its SEGMENTOP.
+/// \param vn is the Varnode to test
+/// \param depth is the number of defining ops still allowed to be traversed
+/// \return \b true if a \e spacebase Varnode feeds \b vn
+bool RuleSegment::isStackRelative(Varnode *vn,int4 depth)
+
+{
+  if (vn->isSpacebase()) return true;
+  if (!vn->isWritten() || depth == 0) return false;
+  PcodeOp *def = vn->getDef();
+  switch(def->code()) {
+    case CPUI_COPY:
+    case CPUI_INT_ADD:
+    case CPUI_INT_SUB:
+    case CPUI_INT_ZEXT:
+    case CPUI_SUBPIECE:
+    case CPUI_PTRADD:
+    case CPUI_PTRSUB:
+      break;
+    default:
+      return false;
+  }
+  for(int4 i=0;i<def->numInput();++i) {
+    if (isStackRelative(def->getIn(i),depth-1))
+      return true;
+  }
+  return false;
+}
+
+/// \brief Rewrite a SEGMENTOP whose base is a constant other than the default segment
+///
+/// The SEGMENTOP prints as its inner offset only, which is right for a near pointer into
+/// the default segment (the \<constresolve> register, DS on x86) but drops a different
+/// segment entirely. When the base is constant, the segment calculation is linear in the
+/// inner offset, and the inner is not stack-relative, the op becomes the far pointer
+/// `INT_ADD(zext(inner), base << innerbits)`: the same base:inner encoding as a far pointer
+/// value, so the constant resolves to the segment's address (and any symbol there) the
+/// way other far pointers do.
+/// \param op is the SEGMENTOP with a constant base and non-constant inner
+/// \param segdef is the segment definition
+/// \param data is the function being analyzed
+/// \return 1 if the op was rewritten, 0 otherwise
+int4 RuleSegment::applyConstantBase(PcodeOp *op,SegmentOp *segdef,Funcdata &data)
+
+{
+  const VarnodeData &resolve = segdef->getResolve();
+  if (resolve.space == (AddrSpace *)0) return 0;
+  uintb base = op->getIn(1)->getOffset();
+  if (base == data.getArch()->context->getTrackedValue(resolve,op->getAddr()))
+    return 0;			// The default segment: a near pointer
+  Varnode *inner = op->getIn(2);
+  if (isStackRelative(inner,4)) return 0;
+
+  int4 innersize = segdef->getInnerSize();
+  int4 outsize = op->getOut()->getSize();
+  if (innersize + segdef->getBaseSize() > outsize)
+    return 0;			// No room for a base:inner encoding
+  vector<uintb> bindlist;
+  bindlist.push_back(base);
+  bindlist.push_back(0);
+  uintb segaddr = segdef->execute(bindlist);
+  uintb innermask = calc_mask(innersize);
+  bindlist[1] = innermask;
+  if (segdef->execute(bindlist) != ((segaddr + innermask) & calc_mask(outsize)))
+    return 0;			// Not base + offset; leave it to the segment definition
+
+  PcodeOp *extop = data.newOp(1,op->getAddr());
+  data.opSetOpcode(extop,CPUI_INT_ZEXT);
+  Varnode *extvn = data.newUniqueOut(outsize,extop);
+  data.opSetInput(extop,inner,0);
+  data.opInsertBefore(extop,op);
+  data.opRemoveInput(op,2);
+  data.opSetInput(op,extvn,0);
+  data.opSetInput(op,data.newConstant(outsize,base << (8 * innersize)),1);
+  data.opSetOpcode(op,CPUI_INT_ADD);
+  return 1;
 }
 
 int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
@@ -9030,6 +9116,9 @@ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
     data.opSetInput(op,data.newConstant(op->getOut()->getSize(),val),0);
     data.opSetOpcode(op,CPUI_COPY);
     return 1;
+  }
+  else if (vn1->isConstant()) {
+    return applyConstantBase(op,segdef,data);
   }
   else if (segdef->hasFarPointerSupport()) {
     // If the hi and lo pieces come from a contigouous source

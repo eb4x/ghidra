@@ -1,0 +1,37 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    Real-mode accesses through a segment register with a known constant value, other than
+    the tracked DS. readfar loads ES from a read-only word (0x2075) and reads ES:[BX], with
+    a byte array mapped at 2075:0000; the access must index that array. readimm loads ES
+    from an immediate (0x3000) and reads ES:[BX] with nothing mapped there; the access
+    must keep its segment as the far pointer 3000:0000. readnear reads DS:[BX] with DS at
+    its tracked value, a near pointer that must not grow a segment.
+-->
+<bytechunk space="ram" offset="0x8100" readonly="true">7520</bytechunk>
+<bytechunk space="ram" offset="0x10000" readonly="true">8e060001268a07c3</bytechunk>
+<bytechunk space="ram" offset="0x10010" readonly="true">8a07c3</bytechunk>
+<bytechunk space="ram" offset="0x10020" readonly="true">b800308ec0268a07c3</bytechunk>
+<symbol name="readfar" space="ram" offset="0x10000"/>
+<symbol name="readnear" space="ram" offset="0x10010"/>
+<symbol name="readimm" space="ram" offset="0x10020"/>
+</binaryimage>
+<script>
+  <com>option readonly on</com>
+  <com>set track DS 0x800 r0x10000 r0x10100</com>
+  <com>map addr r0x20750 uint1 fixed_slots[3]</com>
+  <com>lo fu readfar</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu readimm</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu readnear</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="Segment far #1" min="1" max="1">fixed_slots\[in_BX\]</stringmatch>
+<stringmatch name="Segment far #2" min="1" max="1">in_BX \+ 0x30000000\)</stringmatch>
+<stringmatch name="Segment far #3" min="0" max="0">0x8000</stringmatch>
+</decompilertest>
