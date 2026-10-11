@@ -221,10 +221,49 @@ int4 RulePiece2Zext::applyOp(PcodeOp *op,Funcdata &data)
 
 /// \class RulePiece2Sext
 /// \brief Concatenation with sign bits becomes an extension: `concat( V s>> #0x1f , V)  => sext(V)`
+///
+/// The sign bits can also be the negated sign test `zext(W s< 0) * -1`, as produced by subtracting a
+/// carry flag from itself, where \b V is \b W or the most significant piece of \b W.
 void RulePiece2Sext::getOpList(vector<uint4> &oplist) const
 
 {
   oplist.push_back(CPUI_PIECE);
+}
+
+/// \brief Test if the given Varnode is all sign bits of \b x, as the negation of a sign test
+///
+/// \param vn is the given Varnode
+/// \param x is the Varnode whose sign bit is extended
+/// \return \b true if the given Varnode is `zext(W s< 0) * -1`, where \b W has the same sign bit as \b x
+bool RulePiece2Sext::isNegatedSignTest(Varnode *vn,Varnode *x)
+
+{
+  if (!vn->isWritten()) return false;
+  PcodeOp *negop = vn->getDef();
+  if (negop->code() == CPUI_INT_MULT) {
+    Varnode *cvn = negop->getIn(1);
+    if (!cvn->isConstant() || cvn->getOffset() != calc_mask(cvn->getSize())) return false;
+  }
+  else if (negop->code() != CPUI_INT_2COMP)
+    return false;
+  Varnode *boolvn = negop->getIn(0);
+  if (!boolvn->isWritten()) return false;
+  PcodeOp *testop = boolvn->getDef();
+  if (testop->code() == CPUI_INT_ZEXT) {
+    boolvn = testop->getIn(0);
+    if (!boolvn->isWritten()) return false;
+    testop = boolvn->getDef();
+  }
+  else if (boolvn->getSize() != 1)
+    return false;
+  if (testop->code() != CPUI_INT_SLESS) return false;
+  if (!testop->getIn(1)->isConstant() || testop->getIn(1)->getOffset() != 0) return false;
+  Varnode *w = testop->getIn(0);
+  if (w == x) return true;
+  if (!x->isWritten()) return false;
+  PcodeOp *subop = x->getDef();
+  if (subop->code() != CPUI_SUBPIECE || subop->getIn(0) != w) return false;
+  return (subop->getIn(1)->getOffset() + x->getSize() == w->getSize());
 }
 
 int4 RulePiece2Sext::applyOp(PcodeOp *op,Funcdata &data)
@@ -236,12 +275,15 @@ int4 RulePiece2Sext::applyOp(PcodeOp *op,Funcdata &data)
   shiftout = op->getIn(0);
   if (!shiftout->isWritten()) return 0;
   shiftop = shiftout->getDef();
-  if (shiftop->code() != CPUI_INT_SRIGHT) return 0;
-  if (!shiftop->getIn(1)->isConstant()) return 0;
-  int4 n = shiftop->getIn(1)->getOffset();
-  x = shiftop->getIn(0);
-  if (x != op->getIn(1)) return 0;
-  if (n != 8*x->getSize() -1) return 0;
+  x = op->getIn(1);
+  if (shiftop->code() == CPUI_INT_SRIGHT) {
+    if (!shiftop->getIn(1)->isConstant()) return 0;
+    int4 n = shiftop->getIn(1)->getOffset();
+    if (x != shiftop->getIn(0)) return 0;
+    if (n != 8*x->getSize() -1) return 0;
+  }
+  else if (!isNegatedSignTest(shiftout,x))
+    return 0;
 
   data.opRemoveInput(op,0);
   data.opSetOpcode(op,CPUI_INT_SEXT);
@@ -5143,8 +5185,9 @@ int4 RuleShiftSub::applyOp(PcodeOp *op,Funcdata &data)
 /// \class RuleHumptyDumpty
 /// \brief Simplify break and rejoin:  `concat( sub(V,c), sub(V,0) )  =>  V`
 ///
-/// There is also the variation:
+/// There are also the variations:
 ///  - `concat( sub(V,c), sub(V,d) )  => sub(V,d)`
+///  - `concat( sext(sub(V,c)), sub(V,d) )  =>  V s>> 8*d`  if the pieces are the most significant part of V
 void RuleHumptyDumpty::getOpList(vector<uint4> &oplist) const
 
 {
@@ -5162,6 +5205,12 @@ int4 RuleHumptyDumpty::applyOp(PcodeOp *op,Funcdata &data)
   vn1 = op->getIn(0);
   if (!vn1->isWritten()) return 0;
   sub1 = vn1->getDef();
+  bool signext = (sub1->code() == CPUI_INT_SEXT);
+  if (signext) {
+    vn1 = sub1->getIn(0);
+    if (!vn1->isWritten()) return 0;
+    sub1 = vn1->getDef();
+  }
   if (sub1->code() != CPUI_SUBPIECE) return 0; // from piece1
   vn2 = op->getIn(1);
   if (!vn2->isWritten()) return 0;
@@ -5178,6 +5227,14 @@ int4 RuleHumptyDumpty::applyOp(PcodeOp *op,Funcdata &data)
 
   if (pos1 != pos2 + size2) return 0; // Pieces do not match up
 
+  if (signext) {		// Most significant part of the whole, sign extended back to full size
+    if (pos1 + size1 != root->getSize()) return 0;
+    if (op->getOut()->getSize() != root->getSize()) return 0;
+    data.opSetOpcode(op,CPUI_INT_SRIGHT);
+    data.opSetInput(op,root,0);
+    data.opSetInput(op,data.newConstant(4,8*pos2),1);
+    return 1;
+  }
   if ((pos2==0)&&(size1+size2==root->getSize())) {	// Pieced together whole thing
     data.opRemoveInput(op,1);
     data.opSetInput(op,root,0);

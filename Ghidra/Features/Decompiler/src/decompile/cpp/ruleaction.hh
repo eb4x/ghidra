@@ -124,6 +124,7 @@ public:
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };
 class RulePiece2Sext : public Rule {
+  static bool isNegatedSignTest(Varnode *vn,Varnode *x);
 public:
   RulePiece2Sext(const string &g) : Rule(g, 0, "piece2sext") {}	///< Constructor
   virtual Rule *clone(const ActionGroupList &grouplist) const {

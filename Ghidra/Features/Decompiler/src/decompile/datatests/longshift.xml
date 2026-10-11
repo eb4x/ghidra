@@ -1,0 +1,72 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    16-bit code shifting a 32-bit value held in DX:AX one bit at a time, through the carry flag.
+    longsar1 and longsar7 shift their parameter right by 1 and 7 with SAR DX,1 / RCR AX,1 pairs,
+    longshr3 shifts it right by 3 with SHR DX,1 / RCR AX,1 pairs, and longshl3 left by 3 with
+    SHL AX,1 / RCL DX,1 pairs.  randrange is MSC code:  it multiplies (hi - lo + 1) by rand() into
+    DX:AX, shifts the product right by 8 with byte moves (MOV AL,AH / MOV AH,DL / MOV DL,DH /
+    SHL DH,1 / SBB DH,DH), then by 7 more with SAR/RCR pairs, uses only AX, and adds lo.
+-->
+<bytechunk space="ram" offset="0x10000" readonly="true">
+558bec8b46048b5606d1fad1d85dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x10020" readonly="true">
+558bec8b46048b5606d1fad1d8d1fad1
+d8d1fad1d8d1fad1d8d1fad1d8d1fad1
+d8d1fad1d85dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x10060" readonly="true">
+558bec8b46048b5606d1ead1d8d1ead1
+d8d1ead1d85dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x10080" readonly="true">
+558bec8b46048b5606d1e0d1d2d1e0d1
+d2d1e0d1d25dc3
+</bytechunk>
+<bytechunk space="ram" offset="0x100f0" readonly="true">b82a00cb</bytechunk>
+<bytechunk space="ram" offset="0x10100" readonly="true">
+558bec9af00000108b4e082b4e0641f7
+e98ac48ae28ad6d0e61af6d1fad1d8d1
+fad1d8d1fad1d8d1fad1d8d1fad1d8d1
+fad1d8d1fad1d80346065dcb
+</bytechunk>
+<symbol name="longsar1" space="ram" offset="0x10000"/>
+<symbol name="longsar7" space="ram" offset="0x10020"/>
+<symbol name="longshr3" space="ram" offset="0x10060"/>
+<symbol name="longshl3" space="ram" offset="0x10080"/>
+<symbol name="rand" space="ram" offset="0x100f0"/>
+<symbol name="randrange" space="ram" offset="0x10100"/>
+</binaryimage>
+<script>
+  <com>parse line extern int4 longsar1(int4 x);</com>
+  <com>parse line extern int4 longsar7(int4 x);</com>
+  <com>parse line extern uint4 longshr3(uint4 x);</com>
+  <com>parse line extern int4 longshl3(int4 x);</com>
+  <com>parse line extern int2 __cdecl16far rand(void);</com>
+  <com>parse line extern int2 __cdecl16far randrange(int2 lo,int2 hi);</com>
+  <com>lo fu longsar1</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu longsar7</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu longshr3</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu longshl3</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu randrange</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="Long shift #1" min="1" max="1">return x &gt;&gt; 1;</stringmatch>
+<stringmatch name="Long shift #2" min="1" max="1">return x &gt;&gt; 7;</stringmatch>
+<stringmatch name="Long shift #3" min="1" max="1">return x &gt;&gt; 3;</stringmatch>
+<stringmatch name="Long shift #4" min="1" max="1">return x &lt;&lt; 3;</stringmatch>
+<stringmatch name="Long shift #5" min="1" max="1">return \(int2\)\(\(int4\)iVar1 \* \(int4\)\(\(hi - lo\) \+ 1\) &gt;&gt; 0xf\) \+ lo;</stringmatch>
+<stringmatch name="Long shift #6" min="0" max="0">CONCAT</stringmatch>
+<stringmatch name="Long shift #7" min="0" max="0">!= 0</stringmatch>
+</decompilertest>
