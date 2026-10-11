@@ -237,11 +237,26 @@ class ShiftForm {
   bool verifyShiftAmount(void);
   bool mapLeft(void);
   bool mapRight(void);
+  bool carryright;		///< \b true for a right shift through carry, \b false for left
+  PcodeOp *pieceshift;		///< Shift of the piece the carry comes from (may be null)
+  Varnode *base;		///< Value shifted to produce the piece the carry comes from
+  int4 baseamount;		///< Shift amount producing that piece from \b base
+  static void traceBit(Varnode *&vn,int4 &bit);
+  static bool isCarrySource(Varnode *vn,int4 bit,Varnode *root,int4 rootbit);
+  static bool isConstantShift(PcodeOp *op,bool right);
+  static bool decodeCarry(Varnode *carry,Varnode *&operand,Varnode *&root,int4 &rootbit);
+  static PcodeOp *findPieceShift(Varnode *piece,bool right,Varnode *&base,int4 &baseamount);
+  static void reRoot(Funcdata &data,Varnode *base,int4 baseamount,Varnode *shifted,OpCode shiftopc);
+  Varnode *findPieceFromCarry(Varnode *carry,Varnode *other);
+  bool mapRightCarry(Varnode *a,Varnode *b);
+  bool mapLeftCarry(Varnode *a,Varnode *b);
 public:
   bool verifyLeft(Varnode *h,Varnode *l,PcodeOp *loop);
   bool verifyRight(Varnode *h,Varnode *l,PcodeOp *hiop);
+  bool verifyCarry(PcodeOp *op);
   bool applyRuleLeft(SplitVarnode &i,PcodeOp *loop,bool workishi,Funcdata &data);
   bool applyRuleRight(SplitVarnode &i,PcodeOp *hiop,bool workishi,Funcdata &data);
+  bool applyRuleCarry(PcodeOp *op,Funcdata &data);
 };
 
 class MultForm {
@@ -326,6 +341,22 @@ public:
     return new RuleDoubleIn(getGroup());
   }
   virtual void reset(Funcdata &data);
+  virtual void getOpList(vector<uint4> &oplist) const;
+  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
+};
+
+/// \brief Collapse a one bit shift of a double precision value, done through a carry bit
+///
+/// One piece receives the bit shifted out of the other piece as a zero extended boolean.  This is how
+/// processors with a rotate-through-carry instruction shift a value held in two registers:
+/// `SAR DX,1 ; RCR AX,1` or `SHL AX,1 ; RCL DX,1` on x86, for instance.
+class RuleDoubleShiftCarry : public Rule {
+public:
+  RuleDoubleShiftCarry(const string &g) : Rule(g, 0, "doubleshiftcarry") {}	///< Constructor
+  virtual Rule *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Rule *)0;
+    return new RuleDoubleShiftCarry(getGroup());
+  }
   virtual void getOpList(vector<uint4> &oplist) const;
   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
 };

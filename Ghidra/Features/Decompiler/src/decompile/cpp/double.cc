@@ -2717,6 +2717,414 @@ bool ShiftForm::applyRuleRight(SplitVarnode &i,PcodeOp *hiop,bool workishi,Funcd
   return true;
 }
 
+/// \brief Follow a single bit back through operations that only move it
+///
+/// The bit is traced through COPY, extensions, SUBPIECE, PIECE, and shifts and masks by a constant,
+/// stopping at the first operation that computes it.
+/// \param vn is the Varnode holding the bit, updated to the earliest Varnode found holding the same bit
+/// \param bit is the position of the bit, updated to its position within the final Varnode
+void ShiftForm::traceBit(Varnode *&vn,int4 &bit)
+
+{
+  for(int4 count=0;count<8;++count) {
+    if (!vn->isWritten()) return;
+    PcodeOp *op = vn->getDef();
+    Varnode *invn = op->getIn(0);
+    switch(op->code()) {
+      case CPUI_COPY:
+      case CPUI_INT_ZEXT:
+      case CPUI_INT_SEXT:
+	if (bit >= 8*invn->getSize()) return;	// Bit is an extension
+	break;
+      case CPUI_SUBPIECE:
+	bit += 8*(int4)op->getIn(1)->getOffset();
+	break;
+      case CPUI_PIECE:
+	if (bit < 8*op->getIn(1)->getSize())
+	  invn = op->getIn(1);
+	else
+	  bit -= 8*op->getIn(1)->getSize();
+	break;
+      case CPUI_INT_RIGHT:
+      case CPUI_INT_SRIGHT:
+	if (!op->getIn(1)->isConstant()) return;
+	if (bit + op->getIn(1)->getOffset() >= 8*invn->getSize()) return;	// Bit is shifted in
+	bit += (int4)op->getIn(1)->getOffset();
+	break;
+      case CPUI_INT_LEFT:
+	if (!op->getIn(1)->isConstant()) return;
+	if (op->getIn(1)->getOffset() > bit) return;	// Bit is shifted in
+	bit -= (int4)op->getIn(1)->getOffset();
+	break;
+      case CPUI_INT_AND:
+	if (!op->getIn(1)->isConstant() || bit >= 8*sizeof(uintb)) return;
+	if (((op->getIn(1)->getOffset() >> bit) & 1) == 0) return;
+	break;
+      default:
+	return;
+    }
+    vn = invn;
+  }
+}
+
+/// \param vn is the given Varnode
+/// \param bit is the position of the bit within the given Varnode
+/// \param root is the Varnode holding the carry bit, as returned by traceBit()
+/// \param rootbit is the position of the carry bit within \b root
+/// \return \b true if the bit of the given Varnode traces back to the carry bit
+bool ShiftForm::isCarrySource(Varnode *vn,int4 bit,Varnode *root,int4 rootbit)
+
+{
+  traceBit(vn,bit);
+  return (vn == root && bit == rootbit);
+}
+
+/// \brief Return \b true if the given PcodeOp shifts in the given direction by a constant
+///
+/// \param op is the given PcodeOp
+/// \param right is \b true for a right shift, signed or unsigned, \b false for a left shift
+/// \return \b true if the PcodeOp is a shift in the given direction
+bool ShiftForm::isConstantShift(PcodeOp *op,bool right)
+
+{
+  OpCode code = op->code();
+  if (right) {
+    if (code != CPUI_INT_RIGHT && code != CPUI_INT_SRIGHT) return false;
+  }
+  else if (code != CPUI_INT_LEFT)
+    return false;
+  return op->getIn(1)->isConstant();
+}
+
+/// \brief Find the one bit shift of a double precision piece, in the given direction
+///
+/// The shift may be applied to the piece directly.  Earlier shifts of the same value may have
+/// been collapsed into the piece, `piece = base >> c`, in which case the shift is `base >> c+1`.
+/// For a right shift of a most significant piece split from a whole, the shift may have been pushed into
+/// the whole: `sub(whole >> 8*off+1, 0)`.
+/// \param piece is the given piece
+/// \param right is \b true for a right shift (of \b hi), \b false for a left shift (of \b lo)
+/// \param base passes back the Varnode the shift is relative to, or null for the pushed form
+/// \param baseamount passes back the shift amount, relative to \b base, that produces \b piece
+/// \return the PcodeOp producing the shifted piece, or null if there isn't one
+PcodeOp *ShiftForm::findPieceShift(Varnode *piece,bool right,Varnode *&base,int4 &baseamount)
+
+{
+  list<PcodeOp *>::const_iterator iter;
+  for(iter=piece->beginDescend();iter!=piece->endDescend();++iter) {
+    PcodeOp *shiftop = *iter;
+    if (!isConstantShift(shiftop,right)) continue;
+    if (shiftop->getIn(0) != piece) continue;
+    if (shiftop->getIn(1)->getOffset() != 1) continue;
+    base = piece;
+    baseamount = 0;
+    return shiftop;
+  }
+  if (piece->isWritten() && isConstantShift(piece->getDef(),right)) {
+    PcodeOp *pieceop = piece->getDef();
+    base = pieceop->getIn(0);
+    baseamount = (int4)pieceop->getIn(1)->getOffset();
+    for(iter=base->beginDescend();iter!=base->endDescend();++iter) {
+      PcodeOp *shiftop = *iter;
+      if (shiftop->code() != pieceop->code()) continue;
+      if (shiftop->getIn(0) != base) continue;
+      if (!shiftop->getIn(1)->isConstant()) continue;
+      if (shiftop->getIn(1)->getOffset() != baseamount + 1) continue;
+      return shiftop;
+    }
+  }
+  base = (Varnode *)0;
+  if (!right || !piece->isWritten()) return (PcodeOp *)0;
+  PcodeOp *subop = piece->getDef();
+  if (subop->code() != CPUI_SUBPIECE) return (PcodeOp *)0;
+  Varnode *whole = subop->getIn(0);
+  uintb offset = subop->getIn(1)->getOffset();
+  if (offset + piece->getSize() != whole->getSize()) return (PcodeOp *)0;
+  for(iter=whole->beginDescend();iter!=whole->endDescend();++iter) {
+    PcodeOp *shiftop = *iter;
+    if (!isConstantShift(shiftop,true)) continue;
+    if (shiftop->getIn(1)->getOffset() != 8*offset+1) continue;
+    list<PcodeOp *>::const_iterator iter2;
+    Varnode *shiftvn = shiftop->getOut();
+    for(iter2=shiftvn->beginDescend();iter2!=shiftvn->endDescend();++iter2) {
+      PcodeOp *truncop = *iter2;
+      if (truncop->code() != CPUI_SUBPIECE) continue;
+      if (truncop->getIn(1)->getOffset() != 0) continue;
+      if (truncop->getOut()->getSize() != piece->getSize()) continue;
+      return truncop;
+    }
+  }
+  return (PcodeOp *)0;
+}
+
+/// \brief Re-express other shifts of the same base relative to a newly recovered piece
+///
+/// Shifts of \b base by more than \b baseamount+1, collapsed from a chain of single bit shifts, are
+/// changed to shift the given piece instead, so that the next step in the chain can be recognized.
+/// \param data is the function being transformed
+/// \param base is the Varnode the shifts are relative to
+/// \param baseamount is the amount by which \b base was shifted to produce the input piece
+/// \param shifted is the newly recovered piece, equal to \b base shifted by \b baseamount+1
+/// \param shiftopc is the opcode of the shift producing \b shifted
+void ShiftForm::reRoot(Funcdata &data,Varnode *base,int4 baseamount,Varnode *shifted,OpCode shiftopc)
+
+{
+  vector<PcodeOp *> oplist;
+  list<PcodeOp *>::const_iterator iter;
+  for(iter=base->beginDescend();iter!=base->endDescend();++iter) {
+    PcodeOp *op = *iter;
+    if (op->code() != shiftopc) continue;
+    if (op->getIn(0) != base) continue;
+    if (!op->getIn(1)->isConstant()) continue;
+    if (op->getIn(1)->getOffset() <= baseamount + 1) continue;
+    if (op->getOut()->getSize() != shifted->getSize()) continue;
+    oplist.push_back(op);
+  }
+  for(int4 i=0;i<oplist.size();++i) {
+    PcodeOp *op = oplist[i];
+    Varnode *sa = op->getIn(1);
+    data.opSetInput(op,shifted,0);
+    data.opSetInput(op,data.newConstant(sa->getSize(),sa->getOffset() - baseamount - 1),1);
+  }
+}
+
+/// \brief Decode a boolean testing a single bit
+///
+/// The boolean is either `(V & mask) != 0`, with a single bit set in the mask, or `V s< 0`, which
+/// tests the sign bit.  The tested bit is traced back with traceBit().
+/// \param carry is the boolean
+/// \param operand passes back \b V
+/// \param root passes back the Varnode the tested bit traces back to
+/// \param rootbit passes back the position of the tested bit within \b root
+/// \return \b true if the boolean has one of the forms
+bool ShiftForm::decodeCarry(Varnode *carry,Varnode *&operand,Varnode *&root,int4 &rootbit)
+
+{
+  if (!carry->isWritten()) return false;
+  PcodeOp *op = carry->getDef();
+  if (op->code() == CPUI_INT_SLESS) {
+    if (!op->getIn(1)->isConstant() || op->getIn(1)->getOffset() != 0) return false;
+    operand = op->getIn(0);
+    rootbit = 8*operand->getSize() - 1;
+  }
+  else if (op->code() == CPUI_INT_NOTEQUAL) {
+    if (!op->getIn(1)->isConstant() || op->getIn(1)->getOffset() != 0) return false;
+    Varnode *andvn = op->getIn(0);
+    if (!andvn->isWritten()) return false;
+    PcodeOp *andop = andvn->getDef();
+    if (andop->code() != CPUI_INT_AND) return false;
+    if (!andop->getIn(1)->isConstant()) return false;
+    uintb mask = andop->getIn(1)->getOffset();
+    if (mask == 0 || (mask & (mask-1)) != 0) return false;	// Must test a single bit
+    operand = andop->getIn(0);
+    rootbit = leastsigbit_set(mask);
+  }
+  else
+    return false;
+  root = operand;
+  traceBit(root,rootbit);
+  return true;
+}
+
+/// \brief Find the double precision piece whose bit is shifted out into the carry
+///
+/// For a right shift, the piece is \b hi and the carry holds its least significant bit.  For a left shift,
+/// the piece is \b lo and the carry holds its most significant bit.  Candidates must be the same size as
+/// the other piece and are tried in order: the operand of the carry test, the piece split with the other piece
+/// from a common whole, and the input to any constant shift in the same basic block.  A candidate that is
+/// itself shifted by one bit in the same direction is preferred, in which case \b pieceshift is filled in.
+/// \param carry is the boolean carry
+/// \param other is the other piece, which is already known
+/// \return the piece, or null if no candidate holds the carry bit
+Varnode *ShiftForm::findPieceFromCarry(Varnode *carry,Varnode *other)
+
+{
+  Varnode *operand,*root;
+  int4 rootbit;
+  if (!decodeCarry(carry,operand,root,rootbit)) return (Varnode *)0;
+  int4 size = other->getSize();
+  int4 bit = carryright ? 0 : 8*size-1;
+  vector<Varnode *> candidates;
+  list<PcodeOp *>::const_iterator iter;
+  if (other->isWritten() && other->getDef()->code() == CPUI_SUBPIECE) {
+    Varnode *whole = other->getDef()->getIn(0);
+    uintb otheroff = carryright ? 0 : size;
+    if (whole->getSize() == 2*size && other->getDef()->getIn(1)->getOffset() == otheroff) {
+      for(iter=whole->beginDescend();iter!=whole->endDescend();++iter) {
+	PcodeOp *subop = *iter;
+	if (subop->code() != CPUI_SUBPIECE) continue;
+	if (subop->getIn(1)->getOffset() != size - otheroff) continue;
+	if (subop->getOut()->getSize() != size) continue;
+	candidates.push_back(subop->getOut());
+      }
+    }
+  }
+  int4 numsplit = candidates.size();	// Pieces split from a common whole with the other piece
+  if (operand->getSize() == size)
+    candidates.push_back(operand);
+  BlockBasic *bl = orop->getParent();
+  for(iter=bl->beginOp();iter!=bl->endOp();++iter) {
+    PcodeOp *op = *iter;
+    if (!isConstantShift(op,carryright)) continue;
+    if (op->getIn(0)->getSize() != size) continue;
+    candidates.push_back(op->getIn(0));
+  }
+  Varnode *unshifted = (Varnode *)0;
+  for(int4 i=0;i<candidates.size();++i) {
+    Varnode *vn = candidates[i];
+    if (vn == other || vn->isConstant()) continue;
+    if (!isCarrySource(vn,bit,root,rootbit)) continue;
+    pieceshift = findPieceShift(vn,carryright,base,baseamount);
+    if (pieceshift != (PcodeOp *)0) return vn;
+    if (unshifted == (Varnode *)0 && i < numsplit)
+      unshifted = vn;		// Without its own shift, the piece must already be paired with the other
+  }
+  pieceshift = (PcodeOp *)0;
+  base = (Varnode *)0;
+  return unshifted;
+}
+
+/// \brief Map a right shift through carry, given which input of the OR is the shifted \b lo
+///
+/// \param a is the putative `lo >> 1`
+/// \param b is the putative `zext(carry) << 8*losize-1`
+/// \return \b true if the inputs match, with \b lo, \b hi, and \b reshi (if it exists) filled in
+bool ShiftForm::mapRightCarry(Varnode *a,Varnode *b)
+
+{
+  carryright = true;
+  if (!a->isWritten()) return false;
+  if (!b->isWritten()) return false;
+  loshift = a->getDef();
+  if (loshift->code() != CPUI_INT_RIGHT) return false; // Must be unsigned RIGHT
+  midshift = b->getDef();
+  if (midshift->code() != CPUI_INT_LEFT) return false;
+  lo = loshift->getIn(0);
+  salo = loshift->getIn(1);
+  samid = midshift->getIn(1);
+  if (!salo->isConstant() || salo->getOffset() != 1) return false;
+  if (!samid->isConstant() || samid->getOffset() != 8*lo->getSize()-1) return false;
+  Varnode *zextvn = midshift->getIn(0);
+  if (!zextvn->isWritten()) return false;
+  PcodeOp *zextop = zextvn->getDef();
+  if (zextop->code() != CPUI_INT_ZEXT) return false;
+  hi = findPieceFromCarry(zextop->getIn(0),lo);
+  if (hi == (Varnode *)0) return false;
+  reslo = orop->getOut();
+  reshi = (Varnode *)0;
+  opc = CPUI_INT_RIGHT;
+  if (pieceshift != (PcodeOp *)0) {
+    reshi = pieceshift->getOut();
+    opc = pieceshift->code();
+    if (opc == CPUI_SUBPIECE)	// Shift pushed into the whole
+      opc = pieceshift->getIn(0)->getDef()->code();
+  }
+  return true;
+}
+
+/// \brief Map a left shift through carry, given which input of the OR is the shifted \b hi
+///
+/// \param a is the putative `hi << 1`
+/// \param b is the putative `zext(carry)`
+/// \return \b true if the inputs match, with \b lo, \b hi, and \b reslo (if it exists) filled in
+bool ShiftForm::mapLeftCarry(Varnode *a,Varnode *b)
+
+{
+  carryright = false;
+  if (!a->isWritten()) return false;
+  if (!b->isWritten()) return false;
+  hishift = a->getDef();
+  if (hishift->code() != CPUI_INT_LEFT) return false;
+  PcodeOp *zextop = b->getDef();
+  if (zextop->code() != CPUI_INT_ZEXT) return false;
+  hi = hishift->getIn(0);
+  salo = hishift->getIn(1);
+  if (!salo->isConstant() || salo->getOffset() != 1) return false;
+  lo = findPieceFromCarry(zextop->getIn(0),hi);
+  if (lo == (Varnode *)0) return false;
+  reshi = orop->getOut();
+  reslo = (pieceshift != (PcodeOp *)0) ? pieceshift->getOut() : (Varnode *)0;
+  opc = CPUI_INT_LEFT;
+  return true;
+}
+
+/// \brief Verify a one bit shift of a double precision value done through a carry bit
+///
+/// Starting from the INT_OR that shifts the carry into one piece of the result, look for either a right shift
+///   - `reslo = (lo >> 1) | (zext(carry) << 8*losize-1)`
+///   - `carry = (hi & 1) != 0`, or any other boolean testing the same bit
+///   - `reshi = hi >> 1`  or  `reshi = hi s>> 1`
+///
+/// or a left shift
+///   - `reshi = (hi << 1) | zext(carry)`
+///   - `carry = lo s< 0`, or any other boolean testing the same bit
+///   - `reslo = lo << 1`
+///
+/// The shift of the piece the carry comes from may be missing, if its result is not used.
+/// \param op is the putative INT_OR
+/// \return \b true if the form matches
+bool ShiftForm::verifyCarry(PcodeOp *op)
+
+{
+  orop = op;
+  for(int4 i=0;i<2;++i) {
+    Varnode *a = orop->getIn(i);
+    Varnode *b = orop->getIn(1-i);
+    if (mapRightCarry(a,b)) return true;
+    if (mapLeftCarry(a,b)) return true;
+  }
+  return false;
+}
+
+/// \brief Collapse a one bit shift of a double precision value done through a carry bit
+///
+/// If the shifted piece the carry comes from exists, both pieces of the result are redefined as pieces of the
+/// shifted whole.  Otherwise only the piece produced by the INT_OR is.  If earlier shifts were collapsed into
+/// the piece the carry comes from, further shifts of the same chain are re-expressed relative to the result.
+/// \param op is the putative INT_OR
+/// \param data is the function being transformed
+/// \return \b true if the transform was applied
+bool ShiftForm::applyRuleCarry(PcodeOp *op,Funcdata &data)
+
+{
+  if (!verifyCarry(op))
+    return false;
+  if (lo->getSize() != hi->getSize()) return false;
+  in.initPartial(lo->getSize()+hi->getSize(),lo,hi);
+
+  if (pieceshift != (PcodeOp *)0) {
+    out.initPartial(in.getSize(),reslo,reshi);
+    existop = SplitVarnode::prepareShiftOp(out,in);
+    if (existop == (PcodeOp *)0)
+      return false;
+    SplitVarnode::createShiftOp(data,out,in,salo,existop,opc);
+    if (base != (Varnode *)0)
+      reRoot(data,base,baseamount,carryright ? reshi : reslo,opc);
+    return true;
+  }
+
+  if (!in.isWholeFeasible(orop))
+    return false;
+  in.findCreateWhole(data);
+  Varnode *whole = in.getWhole();
+  if (carryright) {	// Low bits are the same either way, so continue a chain of signed shifts
+    if (whole->isWritten() && whole->getDef()->code() == CPUI_INT_SRIGHT)
+      opc = CPUI_INT_SRIGHT;
+    else if (hi->isWritten() && hi->getDef()->code() == CPUI_INT_SRIGHT)
+      opc = CPUI_INT_SRIGHT;
+  }
+  PcodeOp *newop = data.newOp(2,orop->getAddr());
+  data.opSetOpcode(newop,opc);
+  Varnode *shiftvn = data.newUniqueOut(whole->getSize(),newop);
+  data.opSetInput(newop,whole,0);
+  data.opSetInput(newop,data.newConstant(salo->getSize(),1),1);
+  data.opInsertBefore(newop,orop);
+  data.opSetOpcode(orop,CPUI_SUBPIECE);
+  data.opSetInput(orop,shiftvn,0);
+  data.opSetInput(orop,data.newConstant(4,carryright ? 0 : lo->getSize()),1);
+  return true;
+}
+
 bool MultForm::mapResHiSmallConst(Varnode *rhi)
 
 { // find reshi=hi1*lo2 + (tmp>>32)
@@ -3260,6 +3668,22 @@ int4 RuleDoubleIn::applyOp(PcodeOp *op,Funcdata &data)
     if (res != 0)
       return res;
   }
+  return 0;
+}
+
+void RuleDoubleShiftCarry::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_INT_OR);
+}
+
+int4 RuleDoubleShiftCarry::applyOp(PcodeOp *op,Funcdata &data)
+
+{
+  if (data.hasUnreachableBlocks()) return 0;
+  ShiftForm shiftform;
+  if (shiftform.applyRuleCarry(op,data))
+    return 1;
   return 0;
 }
 
