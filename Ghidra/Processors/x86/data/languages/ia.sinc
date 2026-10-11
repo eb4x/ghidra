@@ -4447,6 +4447,22 @@ define pcodeop ptwrite;
 :PUSHFQ         is $(LONGMODE_ON) & vexMode=0 &            byte=0x9c            { packflags(rflags); packeflags(rflags); push88(rflags); }
 @endif
 
+# Rotating through the carry by one bit is the step of a shift spanning two registers:
+# keep it a plain shift, so the decompiler can follow the carry from the other register
+macro rcl1(dest) {
+	local tmp = dest;
+	dest = (tmp << 1) | zext(CF);
+	CF = tmp s< 0;
+	OF = CF ^ (dest s< 0);
+}
+
+macro rcr1(dest, msb) {
+	local tmp = dest;
+	OF = CF ^ (tmp s< 0);
+	dest = (tmp >> 1) | (zext(CF) << msb);
+	CF = (tmp & 1) != 0;
+}
+
 macro rcl8(dest, rotate_count) {
 	local cnt:1 = (rotate_count & 0x1f) % 9;
 	local tmp:2 = (zext(CF) << 8) | zext(dest);
@@ -4456,7 +4472,7 @@ macro rcl8(dest, rotate_count) {
 	conditionalAssign(OF, cnt == 1, CF ^ (dest s< 0), OF);
 }
 
-:RCL  rm8,n1        is vexMode=0 & byte=0xD0; rm8 & n1 & reg_opcode=2 ...       { rcl8(rm8, n1:1); }
+:RCL  rm8,n1        is vexMode=0 & byte=0xD0; rm8 & n1 & reg_opcode=2 ...       { rcl1(rm8); }
 :RCL  rm8,CL        is vexMode=0 & byte=0xD2; CL & rm8 & reg_opcode=2 ...       { rcl8(rm8, CL); }
 :RCL  rm8,imm8      is vexMode=0 & byte=0xC0; rm8 & reg_opcode=2 ... ; imm8     { rcl8(rm8, imm8:1); }
 
@@ -4469,7 +4485,7 @@ macro rcl16(dest, rotate_count) {
 	conditionalAssign(OF, cnt==1, CF ^ (dest s< 0), OF);
 }
 
-:RCL rm16,n1        is vexMode=0 & opsize=0 & byte=0xD1; rm16 & n1 & reg_opcode=2 ...   { rcl16(rm16, n1:1); }
+:RCL rm16,n1        is vexMode=0 & opsize=0 & byte=0xD1; rm16 & n1 & reg_opcode=2 ...   { rcl1(rm16); }
 :RCL rm16,CL        is vexMode=0 & opsize=0 & byte=0xD3; CL & rm16 & reg_opcode=2 ...   { rcl16(rm16, CL); }
 :RCL rm16,imm8      is vexMode=0 & opsize=0 & byte=0xC1; rm16 & reg_opcode=2 ... ; imm8 { rcl16(rm16, imm8:1); }
 
@@ -4483,7 +4499,7 @@ macro rcl32(dest, rotate_count) {
 	conditionalAssign(OF, cnt==1, CF ^ (dest s< 0), OF);
 }
 
-:RCL rm32,n1        is vexMode=0 & opsize=1 & byte=0xD1; rm32 & n1 & check_rm32_dest ... & reg_opcode=2 ...   { rcl32(rm32, n1:1); build check_rm32_dest; }
+:RCL rm32,n1        is vexMode=0 & opsize=1 & byte=0xD1; rm32 & n1 & check_rm32_dest ... & reg_opcode=2 ...   { rcl1(rm32); build check_rm32_dest; }
 :RCL rm32,CL        is vexMode=0 & opsize=1 & byte=0xD3; CL & rm32 & check_rm32_dest ... & reg_opcode=2 ...   { rcl32(rm32, CL); build check_rm32_dest; }
 :RCL rm32,imm8      is vexMode=0 & opsize=1 & byte=0xC1; rm32 & check_rm32_dest ... & reg_opcode=2 ... ; imm8 { rcl32(rm32, imm8:1); build check_rm32_dest; }
 
@@ -4501,7 +4517,7 @@ macro rcl64(dest, rotate_count) {
 	conditionalAssign(OF, cnt==1, CF ^ (dest s< 0), OF);
 }
 
-:RCL rm64,n1        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD1; rm64 & n1 & reg_opcode=2 ...   { rcl64(rm64, n1:1); }
+:RCL rm64,n1        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD1; rm64 & n1 & reg_opcode=2 ...   { rcl1(rm64); }
 :RCL rm64,CL        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD3; CL & rm64 & reg_opcode=2 ...   { rcl64(rm64, CL); }
 :RCL rm64,imm8      is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xC1; rm64 & reg_opcode=2 ... ; imm8 { rcl64(rm64, imm8:1); }
 @endif
@@ -4514,7 +4530,7 @@ macro rcr8(dest, rotate_count) {
 	conditionalAssign(CF, cnt == 0, CF, (tmp & 0x100) != 0);
 }
 
-:RCR  rm8,n1        is vexMode=0 & byte=0xD0; rm8 & n1 & reg_opcode=3 ...       { rcr8(rm8, n1:1); }
+:RCR  rm8,n1        is vexMode=0 & byte=0xD0; rm8 & n1 & reg_opcode=3 ...       { rcr1(rm8, 7); }
 :RCR  rm8,CL        is vexMode=0 & byte=0xD2; CL & rm8 & reg_opcode=3 ...       { rcr8(rm8, CL); }
 :RCR rm8,imm8       is vexMode=0 & byte=0xC0; rm8 & reg_opcode=3 ... ; imm8     { rcr8(rm8, imm8:1); }
 
@@ -4527,7 +4543,7 @@ macro rcr16(dest, rotate_count) {
 	conditionalAssign(CF, cnt == 0, CF, (tmp & 0x10000) != 0);
 }
 
-:RCR rm16,n1        is vexMode=0 & opsize=0 & byte=0xD1; rm16 & n1 & reg_opcode=3 ...   { rcr16(rm16, n1:1); }
+:RCR rm16,n1        is vexMode=0 & opsize=0 & byte=0xD1; rm16 & n1 & reg_opcode=3 ...   { rcr1(rm16, 15); }
 :RCR rm16,CL        is vexMode=0 & opsize=0 & byte=0xD3; CL & rm16 & reg_opcode=3 ...   { rcr16(rm16, CL); }
 :RCR rm16,imm8      is vexMode=0 & opsize=0 & byte=0xC1; rm16 & reg_opcode=3 ... ; imm8 { rcr16(rm16, imm8:1); }
 
@@ -4540,7 +4556,7 @@ macro rcr32(dest, rotate_count) {
 	conditionalAssign(CF, cnt == 0, CF, (tmp&0x100000000)!=0);
 }
 
-:RCR rm32,n1        is vexMode=0 & opsize=1 & byte=0xD1; rm32 & n1 & check_rm32_dest ... & reg_opcode=3 ...   { rcr32(rm32, n1:1);     build check_rm32_dest; }
+:RCR rm32,n1        is vexMode=0 & opsize=1 & byte=0xD1; rm32 & n1 & check_rm32_dest ... & reg_opcode=3 ...   { rcr1(rm32, 31);        build check_rm32_dest; }
 :RCR rm32,CL        is vexMode=0 & opsize=1 & byte=0xD3; CL & rm32 & check_rm32_dest ... & reg_opcode=3 ...   { rcr32(rm32, CL);       build check_rm32_dest; }
 :RCR rm32,imm8      is vexMode=0 & opsize=1 & byte=0xC1; rm32 & check_rm32_dest ... & reg_opcode=3 ... ; imm8 { rcr32(rm32, imm8:1);   build check_rm32_dest; }
 
@@ -4555,7 +4571,7 @@ macro rcr64(dest, rotate_count) {
 	conditionalAssign(CF, cnt == 0, CF, upper != 0);
 }
 
-:RCR rm64,n1        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD1; rm64 & n1 & reg_opcode=3 ...   { rcr64(rm64, n1:1); }
+:RCR rm64,n1        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD1; rm64 & n1 & reg_opcode=3 ...   { rcr1(rm64, 63); }
 :RCR rm64,CL        is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xD3; CL & rm64 & reg_opcode=3 ...   { rcr64(rm64, CL); }
 :RCR rm64,imm8      is $(LONGMODE_ON) & vexMode=0 & opsize=2 & byte=0xC1; rm64 & reg_opcode=3 ... ; imm8 { rcr64(rm64, imm8:1); }
 @endif
