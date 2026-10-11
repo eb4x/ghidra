@@ -216,4 +216,26 @@
       <register name="DF"/>
     </unaffected>
   </prototype>
+  <!-- Microsoft C's stack probe: called on entry with the frame size in AX, it
+       returns with SP lowered by AX.  The call's return address push stays in the
+       p-code, so add it back.  __chkstk (also matched as _chkstk) is far in the
+       medium, large and huge models; small and compact-model programs set
+       chkstk16near on the function by hand. -->
+  <callfixup name="chkstk16far">
+    <target name="__chkstk"/>
+    <target name="__aFchkstk"/>
+    <pcode>
+      <body><![CDATA[
+        SP = SP + 4 - AX;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="chkstk16near">
+    <target name="__aNchkstk"/>
+    <pcode>
+      <body><![CDATA[
+        SP = SP + 2 - AX;
+      ]]></body>
+    </pcode>
+  </callfixup>
 </compiler_spec>
