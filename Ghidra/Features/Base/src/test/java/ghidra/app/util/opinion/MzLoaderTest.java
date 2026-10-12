@@ -27,10 +27,12 @@ import java.util.HexFormat;
 import org.junit.After;
 import org.junit.Test;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.util.bin.ByteArrayProvider;
 import ghidra.app.util.importer.ProgramLoader;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.test.AbstractGhidraHeadlessIntegrationTest;
@@ -151,6 +153,17 @@ public class MzLoaderTest extends AbstractGhidraHeadlessIntegrationTest {
 		return value.longValue();
 	}
 
+	/** {@return the flow target of the instruction disassembled at {@code at}} */
+	private Address flow(String at) {
+		Address start = addr(at);
+		applyCmd(program, new DisassembleCommand(start, null, false));
+		Instruction instr = program.getListing().getInstructionAt(start);
+		assertNotNull("no instruction at " + at, instr);
+		Address[] flows = instr.getFlows();
+		assertEquals(1, flows.length);
+		return flows[0];
+	}
+
 	@Test
 	public void testAcceptsMz() throws IOException {
 		assertTrue(accepts(new MzLoader(), mz(new byte[0x10])));
@@ -242,5 +255,28 @@ public class MzLoaderTest extends AbstractGhidraHeadlessIntegrationTest {
 		load(mz(image, 0x03));
 		assertEquals("1003:0000", blockStart("1003:0005"));
 		assertEquals(0x1003, cs("1003:0005"));
+	}
+
+	/** A near branch whose IP wraps stays in its code segment, which is not 64K aligned. */
+	@Test
+	public void testNearBranchWrapsInCodeSegment() throws Exception {
+		byte[] image = nops(0x40);
+		put(image, 0x00, "9a 00 00 03 00"); // CALLF 0003:0000
+		put(image, 0x05, "cb"); // RETF
+		put(image, 0x30, "e8 f0 ff"); // 1003:0000: CALL 1003:fff3
+		load(mz(image, 0x03));
+		assertEquals(0x20023L, flow("1003:0000").getOffset());
+	}
+
+	/** A block can run past seg:FFFF; code there is not in the segment, so the page applies. */
+	@Test
+	public void testNearBranchPastSegmentEndStaysInPage() throws Exception {
+		byte[] image = nops(0x10040);
+		put(image, 0x00, "9a 00 00 03 00"); // CALLF 0003:0000
+		put(image, 0x05, "cb"); // RETF
+		put(image, 0x10033, "e8 10 00"); // 2000:0033, in block 1003: CALL 2000:0046
+		load(mz(image, 0x03));
+		assertEquals("1003:0000", blockStart("2000:0033"));
+		assertEquals(0x20046L, flow("2000:0033").getOffset());
 	}
 }
