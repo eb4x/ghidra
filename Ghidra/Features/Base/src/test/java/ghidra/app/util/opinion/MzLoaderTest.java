@@ -18,23 +18,41 @@ package ghidra.app.util.opinion;
 import static org.junit.Assert.*;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.HexFormat;
 
+import org.junit.After;
 import org.junit.Test;
 
 import ghidra.app.util.bin.ByteArrayProvider;
+import ghidra.app.util.importer.ProgramLoader;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.test.AbstractGhidraHeadlessIntegrationTest;
 
 /**
- * Tests for {@link MzLoader}.
+ * Tests for {@link MzLoader}. Load tests place the image at 1000:0000; a relocated segment word
+ * 0003 becomes segment 1003, whose block starts at image offset 0x30.
  */
 public class MzLoaderTest extends AbstractGhidraHeadlessIntegrationTest {
 
 	private static final int HEADER_SIZE = 0x40;
 	private static final int RELOCATION_TABLE = 0x1c;
 	private static final int E_LFANEW = 0x3c;
+
+	private Program program;
+
+	@After
+	public void tearDown() {
+		if (program != null) {
+			program.release(this);
+		}
+	}
 
 	/**
 	 * {@return an MZ file: a 0x40-byte header, then the image; each relocation is the image offset
@@ -97,6 +115,42 @@ public class MzLoaderTest extends AbstractGhidraHeadlessIntegrationTest {
 		}
 	}
 
+	/** {@return an image of {@code length} NOPs} */
+	private static byte[] nops(int length) {
+		byte[] image = new byte[length];
+		Arrays.fill(image, (byte) 0x90);
+		return image;
+	}
+
+	private void load(byte[] file) throws Exception {
+		try (LoadResults<Program> results = ProgramLoader.builder()
+				.source(file)
+				.name("mz")
+				.loaders(MzLoader.class)
+				.language("x86:LE:16:Real Mode")
+				.compiler("default")
+				.load()) {
+			program = results.getPrimaryDomainObject(this);
+		}
+	}
+
+	private Address addr(String at) {
+		return program.getAddressFactory().getAddress(at);
+	}
+
+	private String blockStart(String at) {
+		MemoryBlock block = program.getMemory().getBlock(addr(at));
+		assertNotNull("no block at " + at, block);
+		return block.getStart().toString();
+	}
+
+	private long cs(String at) {
+		Register cs = program.getRegister("CS");
+		BigInteger value = program.getProgramContext().getValue(cs, addr(at), false);
+		assertNotNull("no CS at " + at, value);
+		return value.longValue();
+	}
+
 	@Test
 	public void testAcceptsMz() throws IOException {
 		assertTrue(accepts(new MzLoader(), mz(new byte[0x10])));
@@ -128,5 +182,65 @@ public class MzLoaderTest extends AbstractGhidraHeadlessIntegrationTest {
 		byte[] file = mzWithNewHeader(ne());
 		assertTrue(accepts(new NeLoader(), file));
 		assertFalse(accepts(new MzLoader(), file));
+	}
+
+	/** With no far call into the second segment, a FAR RETURN still ends the first one. */
+	@Test
+	public void testSegmentStartsAfterFarReturn() throws Exception {
+		byte[] image = nops(0x46);
+		put(image, 0x00, "b8 03 00"); // MOV AX,0003 (a segment reference, not a call)
+		put(image, 0x03, "cb"); // RETF
+		put(image, 0x34, "cb"); // 1003:0004, the first segment's last RETF
+		put(image, 0x45, "cb"); // 1003:0015, past the paragraph
+		load(mz(image, 0x01));
+		assertEquals("1003:0005", blockStart("1003:0005"));
+		assertEquals("1000:0000", blockStart("1000:0034"));
+	}
+
+	/**
+	 * The first segment ends in RETF 2, not a FAR RETURN; the second segment's code starts at
+	 * its lowest far CALL/JMP target.
+	 */
+	@Test
+	public void testSegmentStartsAtLowestFarTarget() throws Exception {
+		byte[] image = nops(0x50);
+		put(image, 0x00, "9a 12 00 03 00"); // CALLF 0003:0012
+		put(image, 0x05, "ea 04 00 03 00"); // JMPF 0003:0004
+		put(image, 0x30, "ca 02 00"); // 1003:0000: RETF 2, the first segment's last instruction
+		load(mz(image, 0x03, 0x08));
+		assertEquals("1003:0004", blockStart("1003:0004"));
+		assertEquals("1000:0000", blockStart("1000:0032"));
+		assertEquals(0x1000, cs("1000:0032"));
+	}
+
+	/**
+	 * A FAR RETURN before the lowest far target ends the first segment; one inside the called
+	 * function does not.
+	 */
+	@Test
+	public void testSegmentStartsAfterFarReturnBeforeFarTarget() throws Exception {
+		byte[] image = nops(0x50);
+		put(image, 0x00, "9a 06 00 03 00"); // CALLF 0003:0006
+		put(image, 0x05, "cb"); // RETF
+		put(image, 0x31, "cb"); // 1003:0001, the first segment's last RETF
+		put(image, 0x39, "cb"); // 1003:0009, a RETF inside the called function
+		load(mz(image, 0x03));
+		assertEquals("1003:0002", blockStart("1003:0002"));
+	}
+
+	/**
+	 * A far call to 1003:0000 keeps the block whole, so a FAR RETURN in its first function does
+	 * not move that function to the previous block.
+	 */
+	@Test
+	public void testFarCallToParagraphStartKeepsBlock() throws Exception {
+		byte[] image = nops(0x40);
+		put(image, 0x00, "9a 00 00 03 00"); // CALLF 0003:0000
+		put(image, 0x05, "cb"); // RETF
+		put(image, 0x2f, "cb"); // the first segment's last RETF
+		put(image, 0x35, "cb"); // 1003:0005, a RETF inside the called function
+		load(mz(image, 0x03));
+		assertEquals("1003:0000", blockStart("1003:0005"));
+		assertEquals(0x1003, cs("1003:0005"));
 	}
 }
