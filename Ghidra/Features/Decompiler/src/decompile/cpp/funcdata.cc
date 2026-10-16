@@ -377,13 +377,13 @@ void Funcdata::spacebaseConstant(PcodeOp *op,int4 slot,MapEntry *entry,const Add
     if (sz < origsize)
       zextOp = op;
     else {
-      op->insertInput(1);	// PTRSUB, ADD, SUBPIECE all take 2 parameters
-      if (origsize < sz)
-	subOp = op;
-      else if (extra != 0)
-	extraOp = op;
+      op->insertInput(1);       // PTRSUB, ADD, SUBPIECE all take 2 parameters
+      if (extra != 0)
+        extraOp = op;
+      else if (origsize < sz)
+        subOp = op;
       else
-	addOp = op;
+        addOp = op;
     }
   }
   spacebase_vn = newConstant(sz,0);
@@ -415,16 +415,31 @@ void Funcdata::spacebaseConstant(PcodeOp *op,int4 slot,MapEntry *entry,const Add
   if (typelock && (entrytype->getMetatype() == TYPE_UNKNOWN))
     typelock = false;
   outvn->updateType(ptrentrytype,typelock,false);
+  if (origsize < sz) {          // The new constant is bigger than the original varnode, truncate it
+    // Truncate before adding any extra offset, so the extra INT_ADD can still be pushed
+    // past other additive terms (RulePushPtr) instead of binding to a component first
+    if (subOp == (PcodeOp *)0) {
+      subOp = newOp(2,op->getAddr());
+      opSetOpcode(subOp,CPUI_SUBPIECE);
+      newUniqueOut(origsize,subOp);
+      opInsertBefore(subOp,op);
+    }
+    else
+      opSetOpcode(subOp,CPUI_SUBPIECE);
+    opSetInput(subOp,outvn,0);
+    opSetInput(subOp,newConstant(4, 0), 1);     // Take least significant piece
+    outvn = subOp->getOut();
+  }
   if (extra != 0) {
     if (extraOp == (PcodeOp *)0) {
       extraOp = newOp(2,op->getAddr());
       opSetOpcode(extraOp,CPUI_INT_ADD);
-      newUniqueOut(sz,extraOp);
+      newUniqueOut(outvn->getSize(),extraOp);
       opInsertBefore(extraOp,op);
     }
     else
       opSetOpcode(extraOp,CPUI_INT_ADD);
-    Varnode *extconst = newConstant(sz,extra);
+    Varnode *extconst = newConstant(outvn->getSize(),extra);
     extconst->setSymbolCheck(Varnode::symcheck_complete);
     opSetInput(extraOp,outvn,0);
     opSetInput(extraOp,extconst,1);
@@ -441,19 +456,6 @@ void Funcdata::spacebaseConstant(PcodeOp *op,int4 slot,MapEntry *entry,const Add
       opSetOpcode(zextOp,CPUI_INT_ZEXT);
     opSetInput(zextOp,outvn,0);
     outvn = zextOp->getOut();
-  }
-  else if (origsize < sz) {	// The new constant is bigger than the original varnode, truncate it
-    if (subOp == (PcodeOp *)0) {
-      subOp = newOp(2,op->getAddr());
-      opSetOpcode(subOp,CPUI_SUBPIECE);
-      newUniqueOut(origsize,subOp);
-      opInsertBefore(subOp,op);
-    }
-    else
-      opSetOpcode(subOp,CPUI_SUBPIECE);
-    opSetInput(subOp,outvn,0);
-    opSetInput(subOp,newConstant(4, 0), 1);	// Take least significant piece
-    outvn = subOp->getOut();
   }
   if (!isCopy)
     opSetInput(op,outvn,slot);
