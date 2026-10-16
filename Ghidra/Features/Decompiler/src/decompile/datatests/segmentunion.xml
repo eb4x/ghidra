@@ -1,0 +1,33 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    Real-mode stores through a near pointer to a union. U has two members: cargo, all
+    bytes, and land, with a uint2 created at offset 6. p at DS:3100 holds a pointer to U.
+    Every access goes through segment(DS, BX + 6), so the union field must be chosen
+    from the use of the SEGMENTOP output. wordstore stores 2 bytes at +6 and must select
+    land.created; bytestore stores 1 byte at +6 and must select cargo.h6.
+-->
+<bytechunk space="ram" offset="0x10000" readonly="true">8b1e0031894706c3</bytechunk>
+<bytechunk space="ram" offset="0x10010" readonly="true">8b1e0031884706c3</bytechunk>
+<symbol name="wordstore" space="ram" offset="0x10000"/>
+<symbol name="bytestore" space="ram" offset="0x10010"/>
+</binaryimage>
+<script>
+  <com>option readonly on</com>
+  <com>set track DS 0x2000 r0x10000 r0x10020</com>
+  <com>parse line struct CC { uint1 holds; uint1 h1; uint1 h2; uint1 h3; uint1 h4; uint1 h5; uint1 h6; uint1 h7; uint1 rest[8]; };</com>
+  <com>parse line struct LL { uint1 cnt; uint1 l1; uint1 l2; uint1 l3; uint1 l4; uint1 l5; uint2 created; uint1 wants; uint1 tools; uint1 rest[6]; };</com>
+  <com>parse line union U { CC cargo; LL land; };</com>
+  <com>map addr r0x23100 U *p</com>
+  <com>lo fu wordstore</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu bytestore</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="Segment union #1" min="1" max="1">->land\)\.created = in_AX;</stringmatch>
+<stringmatch name="Segment union #2" min="1" max="1">->cargo\)\.h6 = in_AL;</stringmatch>
+<stringmatch name="Segment union #3" min="0" max="0">xunknown2 \*</stringmatch>
+</decompilertest>
