@@ -694,12 +694,16 @@ void ScoreUnionFields::scoreTrialDown(const Trial &trial,bool lastLevel)
       break;
     case CPUI_SEGMENTOP:
       if (trial.inslot == 2) {
-	if (meta == TYPE_PTR)
-	  score = 5;
-	else if (meta == TYPE_ARRAY || meta == TYPE_STRUCT || meta == TYPE_UNION || meta == TYPE_CODE || meta == TYPE_FLOAT)
-	  score = -5;
-	else
-	  score = -1;
+        if (meta == TYPE_PTR) {
+          score = 5;
+          // The full pointer points to the same data-type as the offset, so keep scoring its uses
+          resType = typegrp.resizePointer((TypePointer *)trial.fitType, trial.op->getOut()->getSize());
+          maxLength = trial.maxLength;
+        }
+        else if (meta == TYPE_ARRAY || meta == TYPE_STRUCT || meta == TYPE_UNION || meta == TYPE_CODE || meta == TYPE_FLOAT)
+          score = -5;
+        else
+          score = -1;
       }
       else {
 	if (meta == TYPE_ARRAY || meta == TYPE_STRUCT || meta == TYPE_UNION || meta == TYPE_CODE || meta == TYPE_FLOAT ||
