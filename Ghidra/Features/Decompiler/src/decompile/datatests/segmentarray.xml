@@ -1,0 +1,38 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    Real-mode stores into a field of an indexed structure array, arr of type S[300] at
+    DS:3144, where S is 28 bytes. Each function scales SI by 0x1c into BX, then stores
+    through [BX + &arr[0].field], so the near constant names a field of element 0. The
+    array index must survive as arr[i].field rather than an integer added to &arr[0].field.
+    one stores to arr[i].b, word to arr[i].c, and three to arr[i].a, .b and .c.
+-->
+<bytechunk space="ram" offset="0x10000" readonly="true">6bde1c88874531c3</bytechunk>
+<bytechunk space="ram" offset="0x10010" readonly="true">6bde1c888744318887453189874631c3</bytechunk>
+<bytechunk space="ram" offset="0x10030" readonly="true">6bde1c89874631c3</bytechunk>
+<symbol name="one" space="ram" offset="0x10000"/>
+<symbol name="three" space="ram" offset="0x10010"/>
+<symbol name="word" space="ram" offset="0x10030"/>
+</binaryimage>
+<script>
+  <com>option readonly on</com>
+  <com>set track DS 0x2000 r0x10000 r0x10040</com>
+  <com>parse line struct S { uint1 a; uint1 b; uint2 c; uint1 d[24]; };</com>
+  <com>map addr r0x23144 S arr[300]</com>
+  <com>lo fu one</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu three</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu word</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="Segment array #1" min="2" max="2">\[unaff_SI\]\.b = </stringmatch>
+<stringmatch name="Segment array #2" min="2" max="2">\[unaff_SI\]\.c = in_AX;</stringmatch>
+<stringmatch name="Segment array #3" min="1" max="1">\+ unaff_SI\)->a = </stringmatch>
+<stringmatch name="Segment array #4" min="0" max="0">&amp;arr\[0\]</stringmatch>
+<stringmatch name="Segment array #5" min="0" max="0">\* 0x1c</stringmatch>
+</decompilertest>
