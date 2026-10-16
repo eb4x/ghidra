@@ -2953,8 +2953,8 @@ with : lockprefx=0 {
 :CALLF ptr1616      is vexMode=0 & addrsize=1 & opsize=0 & byte=0x9a; ptr1616           { local callerCS = CS; push42(CS); build ptr1616; push42(&:2 inst_next); call ptr1616; CS = callerCS; }
 :CALLF ptr1632      is vexMode=0 & addrsize=0 & opsize=1 & byte=0x9a; ptr1632           { local callerCS = CS; push22(CS); build ptr1632; push24(&:4 inst_next); call ptr1632; CS = callerCS; }
 :CALLF ptr1632      is vexMode=0 & addrsize=1 & opsize=1 & byte=0x9a; ptr1632           { local callerCS = CS; pushseg44(CS); build ptr1632; push44(&:4 inst_next); call ptr1632; CS = callerCS; }
-:CALLF Mem          is vexMode=0 & addrsize=0 & opsize=0 & byte=0xff; Mem & reg_opcode=3 ... { local farptr:4 = * Mem; push22(CS); push22(&:2 inst_next);
-                                                                                               CS = farptr(2); local addrptr:$(SIZE) = segment(CS,farptr:2); call [addrptr]; }
+:CALLF Mem          is vexMode=0 & addrsize=0 & opsize=0 & byte=0xff; Mem & reg_opcode=3 ... { local farptr:4 = * Mem; local callerCS = CS; push22(CS); push22(&:2 inst_next);
+                                                                                               CS = farptr(2); local addrptr:$(SIZE) = segment(CS,farptr:2); call [addrptr]; CS = callerCS; }
 :CALLF Mem          is vexMode=0 & addrsize=1 & opsize=0 & byte=0xff; Mem & reg_opcode=3 ... { local dest:4 = * Mem; push42(CS); push42(&:2 inst_next); call [dest]; }
 @ifdef IA64
 :CALLF Mem          is $(LONGMODE_ON) & vexMode=0 & addrsize=2 & opsize=0 & byte=0xff; Mem & reg_opcode=3 ... { local dest:8 = * Mem; push82(CS); push82(&:2 inst_next); call [dest]; }
