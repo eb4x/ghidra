@@ -34,7 +34,11 @@ import ghidra.util.task.TaskMonitor;
  */
 public class SharedReturnAnalysisCmd extends BackgroundCommand<Program> {
 
+	// a longer walk from a jump target is taken to be a whole function, entered only at its start
+	private static final int MAX_TARGET_INSTRUCTIONS = 10000;
+
 	private AddressSetView set;
+	private final Map<Address, Boolean> rejoinsBranching = new HashMap<>();
 	private boolean assumeContiguousFunctions = false;
 	private boolean considerConditionalBranches = false;
 
@@ -74,8 +78,8 @@ public class SharedReturnAnalysisCmd extends BackgroundCommand<Program> {
 
 			AddressSetPropertyMap coldMap =
 				program.getAddressSetPropertyMap(Program.COLD_ENTRY_MAP_NAME);
-			Set<Address> conditionalJumpTargets = new HashSet<>();
-			Set<Address> onlyUnconditionalJumpTargets = new HashSet<>();
+			Set<Address> ownConditionalJumpTargets = new HashSet<>();
+			Set<Address> convertibleJumpTargets = new HashSet<>();
 			if (assumeContiguousFunctions) {
 				// assume if checkAllJumpReferences then set is much more than new function starts
 
@@ -128,34 +132,17 @@ public class SharedReturnAnalysisCmd extends BackgroundCommand<Program> {
 					}
 
 					if (!considerConditionalBranches) {
-						if (conditionalJumpTargets.contains(destAddr)) {
-							// destAddr is a conditional jump target, skip
+						if (ownConditionalJumpTargets.contains(destAddr)) {
 							continue;
 						}
 
-						if (!onlyUnconditionalJumpTargets.contains(destAddr)) {
-							//haven't checked the types of flow refs to destAddr yet
-							ReferenceIterator refIter =
-								program.getReferenceManager().getReferencesTo(destAddr);
-							boolean conditionalRef = false;
-							while (refIter.hasNext()) {
-								Reference ref = refIter.next();
-								RefType refType = ref.getReferenceType();
-								if (!refType.isFlow()) {
-									continue;
-								}
-								if (refType.isConditional()) {
-									conditionalRef = true;
-									break;
-								}
-							}
-							if (conditionalRef) {
-								// found a conditional jump, record destAddr and skip
-								conditionalJumpTargets.add(destAddr);
+						if (!convertibleJumpTargets.contains(destAddr)) {
+							//haven't checked the flow refs to destAddr yet
+							if (isConditionalTargetOfOneFunction(program, destAddr)) {
+								ownConditionalJumpTargets.add(destAddr);
 								continue;
 							}
-							// no conditional flow refs to destAddr
-							onlyUnconditionalJumpTargets.add(destAddr);
+							convertibleJumpTargets.add(destAddr);
 						}
 					}
 
@@ -275,6 +262,30 @@ public class SharedReturnAnalysisCmd extends BackgroundCommand<Program> {
 		}
 	}
 
+	/**
+	 * A conditional branch target is part of the function that branches to it, such as its cold
+	 * part, unless flows reach it from more than one function: then it is a tail they share.
+	 * A flow from outside any function counts as coming from another function.
+	 */
+	private boolean isConditionalTargetOfOneFunction(Program program, Address destAddr) {
+		FunctionManager functionMgr = program.getFunctionManager();
+		boolean conditional = false;
+		Function source = null;
+		for (Reference ref : program.getReferenceManager().getReferencesTo(destAddr)) {
+			RefType refType = ref.getReferenceType();
+			if (!refType.isFlow()) {
+				continue;
+			}
+			Function f = functionMgr.getFunctionContaining(ref.getFromAddress());
+			if (f == null || (source != null && !f.equals(source))) {
+				return false;
+			}
+			source = f;
+			conditional |= refType.isConditional();
+		}
+		return conditional;
+	}
+
 	private Function getFunctionAfter(Program program, Address addr) {
 		Listing listing = program.getListing();
 		FunctionIterator nextFunctionIter =
@@ -310,9 +321,112 @@ public class SharedReturnAnalysisCmd extends BackgroundCommand<Program> {
 				// if there could be, even later in analysis, don't create the function
 				return;
 			}
+			if (rejoinsBranching.computeIfAbsent(entry, a -> rejoinsBranchingFunction(program, a))) {
+				// a block that jumps back into the function that branched to it belongs to it
+				return;
+			}
 			AutoAnalysisManager analysisMgr = AutoAnalysisManager.getAnalysisManager(program);
 			analysisMgr.createFunction(entry, false);
 		}
+	}
+
+	/**
+	 * Whether the code reached from {@code start} jumps back into a function that branches to
+	 * {@code start}: a flow from that function's body enters the code at a later instruction.
+	 * The code reached is what falls through or jumps from {@code start}, without following
+	 * calls, up to the entry of another function or a call target, where it leaves by a tail
+	 * call. Entries from other code don't count, so tails that run into each other, as a
+	 * runtime library's exit routines do, stay tails; nor does a return instruction that other
+	 * code also reaches, since sharing it shares no other code.
+	 */
+	private boolean rejoinsBranchingFunction(Program program, Address start) {
+		Set<Function> sources = getBranchingFunctions(program, start);
+		if (sources.isEmpty()) {
+			return false;
+		}
+		AddressSet code = new AddressSet();
+		Listing listing = program.getListing();
+		Deque<Address> pending = new ArrayDeque<>(List.of(start));
+		int count = 0;
+		while (!pending.isEmpty()) {
+			Address addr = pending.pop();
+			if (code.contains(addr) || (!addr.equals(start) && isEntry(program, addr))) {
+				continue;
+			}
+			Instruction instr = listing.getInstructionAt(addr);
+			if (instr == null) {
+				continue;
+			}
+			if (++count > MAX_TARGET_INSTRUCTIONS) {
+				return false;
+			}
+			code.add(instr.getMinAddress(), instr.getMaxAddress());
+			if (instr.getFallThrough() != null) {
+				pending.push(instr.getFallThrough());
+			}
+			if (instr.getFlowType().isJump()) {
+				pending.addAll(List.of(instr.getFlows()));
+			}
+		}
+		for (Instruction instr : listing.getInstructions(code, true)) {
+			if (instr.getMinAddress().equals(start) || instr.getFlowType().isTerminal()) {
+				continue;
+			}
+			if (isEnteredFrom(sources, instr, code)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private Set<Function> getBranchingFunctions(Program program, Address start) {
+		FunctionManager functionMgr = program.getFunctionManager();
+		Set<Function> sources = new HashSet<>();
+		for (Reference ref : program.getReferenceManager().getReferencesTo(start)) {
+			if (!ref.getReferenceType().isJump()) {
+				continue;
+			}
+			Function f = functionMgr.getFunctionContaining(ref.getFromAddress());
+			if (f != null) {
+				sources.add(f);
+			}
+		}
+		return sources;
+	}
+
+	private boolean isEntry(Program program, Address addr) {
+		if (program.getFunctionManager().getFunctionAt(addr) != null) {
+			return true;
+		}
+		for (Reference ref : program.getReferenceManager().getReferencesTo(addr)) {
+			if (ref.getReferenceType().isCall()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether a jump or fall-through from outside {@code code}, in the body of one of
+	 * {@code functions}, enters {@code instr}.
+	 */
+	private boolean isEnteredFrom(Set<Function> functions, Instruction instr, AddressSetView code) {
+		for (Reference ref : instr.getReferenceIteratorTo()) {
+			Address from = ref.getFromAddress();
+			if (ref.getReferenceType().isJump() && !code.contains(from) && isIn(functions, from)) {
+				return true;
+			}
+		}
+		Address fallFrom = instr.getFallFrom();
+		if (fallFrom == null || code.contains(fallFrom) || !isIn(functions, fallFrom)) {
+			return false;
+		}
+		Instruction fallInstr = instr.getProgram().getListing().getInstructionContaining(fallFrom);
+		return fallInstr != null && instr.getMinAddress().equals(fallInstr.getFallThrough());
+	}
+
+	private static boolean isIn(Set<Function> functions, Address addr) {
+		return functions.stream().anyMatch(f -> f.getBody().contains(addr));
 	}
 
 	private boolean checkIfCouldHaveFallThruTo(Program program, Address location) {
