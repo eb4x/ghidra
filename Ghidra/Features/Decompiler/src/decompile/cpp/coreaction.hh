@@ -190,6 +190,7 @@ class ActionConstantPtr : public Action {
   static AddrSpace *searchForSpaceAttribute(Varnode *vn,PcodeOp *op);
   static AddrSpace *selectInferSpace(Varnode *vn,PcodeOp *op,const vector<AddrSpace *> &spaceList);
   static bool checkCopy(PcodeOp *op,Funcdata &data);
+  static bool isDefaultSegment(AddrSpace *spc,Varnode *vn,PcodeOp *op,Architecture *glb);
   static MapEntry *isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op,int4 slot,
 			     Address &rampoint,uintb &fullEncoding,Funcdata &data);
 public:
