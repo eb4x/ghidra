@@ -230,6 +230,24 @@ public:
   virtual JumpValues *clone(void) const;
 };
 
+/// \brief A switch variable that can only hold one of a few constants
+///
+/// Every value reaching the switch variable is a constant, through COPY and MULTIEQUAL ops,
+/// so it takes exactly those values, not every value in its range. The inherited range still
+/// describes the Varnode, so a later recovery of the same switch matches it.
+class JumpValuesConstantSet : public JumpValuesRange {
+  vector<uintb> values;		///< The possible values, in ascending order
+  mutable int4 curpos;		///< Position of the current value
+public:
+  void setValues(const vector<uintb> &vals) { values = vals; }	///< Set the possible values
+  virtual void truncate(int4 nm) { values.resize(nm); }
+  virtual uintb getSize(void) const { return values.size(); }
+  virtual bool contains(uintb val) const;
+  virtual bool initializeForReading(void) const;
+  virtual bool next(void) const;
+  virtual JumpValues *clone(void) const;
+};
+
 /// \brief A jump-table execution model
 ///
 /// This class holds details of the model and recovers these details in various stages.
@@ -392,6 +410,8 @@ protected:
   bool isPreferredRange(int4 pos,const CircleRange &newRange);
   void findSmallestNormal(const JumpBasic *previous);
   void findNormalized(Funcdata *fd,BlockBasic *rootbl,int4 pathout,const JumpModel *previous,uint4 maxtablesize);
+  static bool collectConstants(Varnode *vn,uint4 maxcount,set<uintb> &res);
+  void restrictToConstants(uint4 maxtablesize);
   void markFoldableGuards();
   void markModel(bool val);		///< Mark (or unmark) all PcodeOps involved in the model
   bool flowsOnlyToModel(Varnode *vn,PcodeOp *trailOp);	///< Check if the given Varnode flows to anything other than \b this model

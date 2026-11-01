@@ -386,6 +386,41 @@ JumpValues *JumpValuesRangeDefault::clone(void) const
   return res;
 }
 
+bool JumpValuesConstantSet::contains(uintb val) const
+
+{
+  return binary_search(values.begin(),values.end(),val);
+}
+
+bool JumpValuesConstantSet::initializeForReading(void) const
+
+{
+  if (values.empty()) return false;
+  curpos = 0;
+  curval = values[0];
+  return true;
+}
+
+bool JumpValuesConstantSet::next(void) const
+
+{
+  curpos += 1;
+  if (curpos >= values.size()) return false;
+  curval = values[curpos];
+  return true;
+}
+
+JumpValues *JumpValuesConstantSet::clone(void) const
+
+{
+  JumpValuesConstantSet *res = new JumpValuesConstantSet();
+  res->range = range;
+  res->normqvn = normqvn;
+  res->startop = startop;
+  res->values = values;
+  return res;
+}
+
 bool JumpModelTrivial::recoverModel(Funcdata *fd,PcodeOp *indop,const JumpModel *previous,uint4 maxtablesize)
 
 {
@@ -1276,6 +1311,69 @@ void JumpBasic::findNormalized(Funcdata *fd,BlockBasic *rootbl,int4 pathout,cons
   }
 }
 
+/// \brief Collect the constants that can reach the given Varnode
+///
+/// Every value must come from a constant through COPY and MULTIEQUAL ops.
+/// \param vn is the given Varnode
+/// \param maxcount is the maximum number of distinct constants to collect
+/// \param res will hold the distinct constants
+/// \return \b true if every value reaching the Varnode is one of the collected constants
+bool JumpBasic::collectConstants(Varnode *vn,uint4 maxcount,set<uintb> &res)
+
+{
+  vector<PcodeOp *> visited;
+  vector<Varnode *> worklist(1,vn);
+  while(!worklist.empty()) {
+    Varnode *curvn = worklist.back();
+    worklist.pop_back();
+    if (curvn->isConstant()) {
+      res.insert(curvn->getOffset());
+      if (res.size() > maxcount) return false;
+      continue;
+    }
+    if (!curvn->isWritten()) return false;
+    PcodeOp *op = curvn->getDef();
+    if (op->code() == CPUI_COPY) {
+      worklist.push_back(op->getIn(0));
+      continue;
+    }
+    if (op->code() != CPUI_MULTIEQUAL) return false;
+    if (find(visited.begin(),visited.end(),op) != visited.end()) continue;	// Loop back to a visited join
+    if (visited.size() >= maxcount) return false;
+    visited.push_back(op);
+    for(int4 i=0;i<op->numInput();++i)
+      worklist.push_back(op->getIn(i));
+  }
+  return !res.empty();
+}
+
+/// \brief Restrict the switch values to the constants that reach the normalized switch variable
+///
+/// Without a guard, the range of the normalized switch variable comes from its non-zero mask,
+/// which for a variable that is only ever set to one of a few constants (e.g. a register set
+/// to one of two code offsets and then jumped through) covers many values it never holds.
+/// If every value reaching the variable is a constant, iterate over just those constants that
+/// are also in the range.
+/// \param maxtablesize is the maximum number of values to allow
+void JumpBasic::restrictToConstants(uint4 maxtablesize)
+
+{
+  Varnode *vn = jrange->getStartVarnode();
+  set<uintb> constants;
+  if (!collectConstants(vn,maxtablesize,constants)) return;
+  vector<uintb> values;
+  for(set<uintb>::const_iterator iter=constants.begin();iter!=constants.end();++iter) {
+    if (jrange->contains(*iter))
+      values.push_back(*iter);
+  }
+  if (values.empty() || values.size() >= jrange->getSize()) return;
+  JumpValuesConstantSet *cset = new JumpValuesConstantSet();
+  cset->setRange(jrange->getRange(),vn,jrange->getStartOp());
+  cset->setValues(values);
+  delete jrange;
+  jrange = cset;
+}
+
 /// \brief Mark the guard CBRANCHs that are truly part of the model.
 ///
 /// These CBRANCHs will be removed from the active control-flow graph, their
@@ -1491,6 +1589,7 @@ bool JumpBasic::recoverModel(Funcdata *fd,PcodeOp *indop,const JumpModel *previo
   jrange = new JumpValuesRange();
   findDeterminingVarnodes(indop,0);
   findNormalized(fd,indop->getParent(),-1,previous,maxtablesize);
+  restrictToConstants(maxtablesize);
   if (jrange->getSize() > maxtablesize)
     return false;
   markFoldableGuards();
