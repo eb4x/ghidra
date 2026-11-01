@@ -123,7 +123,7 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 			}
 			else {
 				// clear out the old references
-				program.getReferenceManager().removeAllReferencesFrom(instr.getMinAddress());
+				removeAnalysisReferences(instr);
 			}
 
 			// label the table and cases
@@ -134,6 +134,21 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 
 			// fixup the function body
 			fixupFunction(f, monitor, instr);
+		}
+	}
+
+	/*
+	 * Remove the references from the switching instruction that analysis may replace,
+	 * keeping those a user or an importer placed there.
+	 */
+	private void removeAnalysisReferences(Instruction instr) {
+		ReferenceManager refMgr = program.getReferenceManager();
+		for (Reference ref : instr.getReferencesFrom()) {
+			SourceType source = ref.getSource();
+			if (source == SourceType.USER_DEFINED || source == SourceType.IMPORTED) {
+				continue;
+			}
+			refMgr.delete(ref);
 		}
 	}
 
