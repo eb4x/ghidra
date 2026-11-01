@@ -29,6 +29,8 @@
 
 namespace ghidra {
 
+class SegmentOp;
+
 /// \brief Structure for sorting out pointer expression trees
 ///
 /// Given a base pointer of known data-type and an additive expression involving
@@ -1382,6 +1384,8 @@ public:
 };
 
 class RuleSegment : public Rule {
+  static bool isStackRelative(Varnode *vn,int4 depth);
+  static int4 applyConstantBase(PcodeOp *op,SegmentOp *segdef,Funcdata &data);
 public:
   RuleSegment(const string &g) : Rule( g, 0, "segment") {}	///< Constructor
   virtual Rule *clone(const ActionGroupList &grouplist) const {
