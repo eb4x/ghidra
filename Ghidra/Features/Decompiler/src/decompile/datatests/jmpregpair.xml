@@ -1,0 +1,55 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    RTLink/Plus VM dispatch (from rtlink-sample.exe, 1012:0046, here at 1000:0046 so the
+    code segment is the 64K page's). DX is one of two constants (0x67 or 0x6c, chosen by
+    a flag at CS:0073) and the function ends in JMP DX. The jump has exactly two targets,
+    1000:0067 and 1000:006c, not every offset up to DX's non-zero mask 0x6f, which would
+    include the second byte of the JMP itself.
+-->
+<bytechunk space="ram" offset="0x10046" readonly="true">
+8bf483c604b86400ba67002ef6067300
+ff7406b86900ba6c008944fcffe2558b
+ec5dcb558bec33c05dcb33c0cb
+</bytechunk>
+<bytechunk space="ram" offset="0x10073">
+000000
+</bytechunk>
+<!--
+    The same shape with large offsets (as VICEROY's $$VM_UNK at CS 0x210d): DX is 0x1251
+    or 0x149c, so DX's non-zero mask gives 0x16de values, more than the maximum table size.
+    The two targets, 2000:1251 and 2000:149c, are RETF stubs. The flag is at 2000:0040.
+-->
+<bytechunk space="ram" offset="0x20010" readonly="true">
+8bf483c604b86400ba51122ef6064000
+ff7406b86900ba9c148944fcffe2
+</bytechunk>
+<bytechunk space="ram" offset="0x20040">
+00
+</bytechunk>
+<bytechunk space="ram" offset="0x21251" readonly="true">
+cb
+</bytechunk>
+<bytechunk space="ram" offset="0x2149c" readonly="true">
+33c0cb
+</bytechunk>
+<symbol name="vmdispatch" space="ram" offset="0x10046"/>
+<symbol name="vmdispatch2" space="ram" offset="0x20010"/>
+</binaryimage>
+<script>
+  <com>set track DS 0x101a r0x10000 r0x100ff</com>
+  <com>set track CS 0x1000 r0x10040 r0x1007f</com>
+  <com>set track CS 0x2000 r0x20000 r0x2ffff</com>
+  <com>lo fu vmdispatch2</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu vmdispatch</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="Jump register pair #1" min="1" max="1">case 0x67:</stringmatch>
+<stringmatch name="Jump register pair #2" min="1" max="1">case 0x6c:</stringmatch>
+<stringmatch name="Jump register pair #3" min="1" max="1">case 0x1251:</stringmatch>
+<stringmatch name="Jump register pair #4" min="1" max="1">case 0x149c:</stringmatch>
+</decompilertest>
