@@ -1090,6 +1090,30 @@ bool ActionConstantPtr::checkCopy(PcodeOp *op,Funcdata &data)
   return data.getArch()->infer_pointers;
 }
 
+/// \brief Is the given constant the value of the default segment register?
+///
+/// In a segmented space, the register that resolves near pointers (DS on x86 real mode) is
+/// usually tracked as a constant, so code that passes it as the segment of a far pointer
+/// (PUSH DS, or the high half of a PIECE) produces a constant equal to its tracked value.
+/// Read as a near pointer, that value lands on an unrelated symbol. A constant of the
+/// segment's size equal to the tracked default segment is taken to be the segment itself.
+/// \param spc is the address space being pointed to
+/// \param vn is the constant Varnode
+/// \param op is the lone descendant of the Varnode
+/// \param glb is the Architecture
+/// \return \b true if the constant matches the default segment value at \b op
+bool ActionConstantPtr::isDefaultSegment(AddrSpace *spc,Varnode *vn,PcodeOp *op,Architecture *glb)
+
+{
+  SegmentOp *segdef = glb->userops.getSegmentOp(spc->getIndex());
+  if (segdef == (SegmentOp *)0) return false;
+  if (!segdef->hasFarPointerSupport()) return false;
+  const VarnodeData &resolve = segdef->getResolve();
+  if (resolve.space == (AddrSpace *)0) return false;
+  if (vn->getSize() != segdef->getBaseSize()) return false;
+  return (vn->getOffset() == glb->context->getTrackedValue(resolve,op->getAddr()));
+}
+
 /// \brief Determine if given Varnode might be a pointer constant.
 ///
 /// If it is a pointer, return the symbol it points to, or NULL otherwise. If it is determined
@@ -1178,6 +1202,8 @@ MapEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op,in
       return (MapEntry *)0;
     // Check if the constant looks like a single bit or mask
     if (bit_transitions(vn->getOffset(),vn->getSize()) < 3)
+      return (MapEntry *)0;
+    if (isDefaultSegment(spc,vn,op,glb))
       return (MapEntry *)0;
     rampoint = glb->resolveConstant(spc,vn->getOffset(),vn->getSize(),op->getAddr(),fullEncoding);
   }
