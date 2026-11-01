@@ -1,0 +1,37 @@
+<decompilertest>
+<binaryimage arch="x86:LE:16:Real Mode:default">
+<!--
+    Real-mode far calls that pass DS's own value as the segment of a far pointer.
+    DS is tracked at 0x2b5a, and the char array msg starts at DS:2b44, so DS:2b5a (the
+    segment value read as a near pointer) falls inside it, at msg + 0x16. segarg pushes
+    DS and a near pointer to msg as two words: the offset must still resolve to msg.
+    segcat pushes DS and BX to a function taking one 4-byte parameter, so the pair
+    becomes CONCAT22(DS,BX). In both, the segment is not a pointer at all.
+-->
+<bytechunk space="ram" offset="0x10000" readonly="true">1eb8442b509a0000002083c404c3</bytechunk>
+<bytechunk space="ram" offset="0x10020" readonly="true">1e539a1000002083c404c3</bytechunk>
+<bytechunk space="ram" offset="0x20000" readonly="true">cb</bytechunk>
+<bytechunk space="ram" offset="0x20010" readonly="true">cb</bytechunk>
+<symbol name="segarg" space="ram" offset="0x10000"/>
+<symbol name="segcat" space="ram" offset="0x10020"/>
+<symbol name="farfn" space="ram" offset="0x20000"/>
+<symbol name="farfn4" space="ram" offset="0x20010"/>
+</binaryimage>
+<script>
+  <com>option readonly on</com>
+  <com>set track DS 0x2b5a r0x10000 r0x10100</com>
+  <com>map addr r0x2e0e4 char msg[64]</com>
+  <com>parse line extern void __cdecl16far farfn(xunknown2 off,xunknown2 seg);</com>
+  <com>parse line extern void __cdecl16far farfn4(xunknown4 p);</com>
+  <com>lo fu segarg</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu segcat</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="DS segment constant #1" min="0" max="0">msg \+ 0x16</stringmatch>
+<stringmatch name="DS segment constant #2" min="1" max="1">farfn\(\(char \*\)msg,0x2b5a\)</stringmatch>
+<stringmatch name="DS segment constant #3" min="1" max="1">CONCAT22\(0x2b5a,in_BX\)</stringmatch>
+</decompilertest>
