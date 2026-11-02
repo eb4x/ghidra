@@ -329,12 +329,21 @@ public class CreateFunctionCmd extends BackgroundCommand<Program> {
 
 		// if the body is undefined, figure it out
 		// get the function body JUST by following flow
-		body = (body == null ? getFunctionBody(program, entry, false, monitor) : body);
+		boolean bodyByFlow = body == null;
+		body = (bodyByFlow ? getFunctionBody(program, entry, false, monitor) : body);
+		AddressSetView flowBody = body;
 
 		Map<Function, AddressSetView> bodyChangeMap = new HashMap<>();
 		body = subtractBodyFromExisting(program, entry, body, bodyChangeMap, monitor);
 
-		return createFunction(nameSpace, funcName, entry, body, nameSource, bodyChangeMap, monitor);
+		if (!createFunction(nameSpace, funcName, entry, body, nameSource, bodyChangeMap,
+			monitor)) {
+			return false;
+		}
+		if (bodyByFlow && newFunc != null && !newFunc.isThunk()) {
+			reclaimReachedCode(program, newFunc, flowBody, bodyChangeMap.keySet(), monitor);
+		}
+		return true;
 	}
 
 	/**
@@ -659,6 +668,15 @@ public class CreateFunctionCmd extends BackgroundCommand<Program> {
 	 */
 	public static boolean fixupFunctionBody(Program program, Function func, TaskMonitor monitor)
 			throws CancelledException {
+		return fixupFunctionBody(program, func, true, monitor);
+	}
+
+	/**
+	 * Recompute function body, handing it afterwards, if reclaim is set, the code it reaches
+	 * that a function it cut still holds (see {@link #reclaimReachedCode}).
+	 */
+	private static boolean fixupFunctionBody(Program program, Function func, boolean reclaim,
+			TaskMonitor monitor) throws CancelledException {
 		if (func == null || func.isExternal()) {
 			return false;
 		}
@@ -690,6 +708,7 @@ public class CreateFunctionCmd extends BackgroundCommand<Program> {
 		catch (OverlappingFunctionException e) {
 
 			Map<Function, AddressSetView> bodyChangeMap = new HashMap<>();
+			AddressSetView flowBody = newBody;
 			try {
 				newBody = subtractBodyFromExisting(program, entry, newBody, bodyChangeMap, monitor);
 
@@ -701,9 +720,55 @@ public class CreateFunctionCmd extends BackgroundCommand<Program> {
 				restoreOriginalBodies(bodyChangeMap);
 				return false;
 			}
+			if (reclaim) {
+				reclaimReachedCode(program, func, flowBody, bodyChangeMap.keySet(), monitor);
+			}
 		}
 
 		return true;
+	}
+
+	/**
+	 * Hand a function the code it reaches that a function it cut still holds.
+	 * <p>
+	 * {@link #subtractBodyFromExisting} leaves a function that starts earlier the code it
+	 * holds below the new function's entry, including code it held only because it flowed
+	 * into the new function's code before that function existed (a jump that later becomes a
+	 * call or tail call). Recomputed now that the new function exists, the cut function lets
+	 * go of that code, and the new function takes it. Otherwise the code stays with a function
+	 * that doesn't reach it, until its next fixup leaves it in no function.
+	 * <p>
+	 * One level deep: the re-fixes don't reclaim in turn, so functions sharing code can't
+	 * pass it back and forth.
+	 *
+	 * @param program the program
+	 * @param func the function just created or fixed up
+	 * @param flowBody func's body by flow, before other functions' code was subtracted
+	 * @param cutFunctions the functions whose bodies were cut to make room for func
+	 * @param monitor task monitor
+	 * @throws CancelledException if cancelled
+	 */
+	private static void reclaimReachedCode(Program program, Function func,
+			AddressSetView flowBody, Set<Function> cutFunctions, TaskMonitor monitor)
+			throws CancelledException {
+		if (cutFunctions.isEmpty()) {
+			return;
+		}
+		AddressSetView unclaimed = flowBody.subtract(func.getBody());
+		if (unclaimed.isEmpty()) {
+			return;
+		}
+		boolean released = false;
+		for (Function cut : cutFunctions) {
+			monitor.checkCancelled();
+			if (cut.isDeleted() || !cut.getBody().intersects(unclaimed)) {
+				continue;
+			}
+			released |= fixupFunctionBody(program, cut, false, monitor);
+		}
+		if (released && !func.isDeleted()) {
+			fixupFunctionBody(program, func, false, monitor);
+		}
 	}
 
 	/**
