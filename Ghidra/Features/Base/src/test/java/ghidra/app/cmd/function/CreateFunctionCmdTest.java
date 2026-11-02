@@ -299,6 +299,30 @@ public class CreateFunctionCmdTest extends AbstractGenericTest {
 		assertNotNull("Function at 0x1100", func(addr(0x1100)));
 	}
 
+	@Test
+	public void testCreateReclaimsCodeHeldByEarlierFunction() throws Exception {
+		// A jumps to C's entry; C has a cold block below its entry that only C reaches
+		builder.setBytes("0x1100", "40 eb 1d"); // A: INC EAX; JMP 0x1120
+		builder.setBytes("0x1110", "40 c3"); // cold: INC EAX; RET
+		builder.setBytes("0x1120", "85 c0 74 ec 48 c3"); // C: TEST; JZ 0x1110; DEC EAX; RET
+		builder.disassemble("0x1100", 3);
+		builder.disassemble("0x1110", 2);
+		builder.disassemble("0x1120", 6);
+
+		int transactionID = program.startTransaction("Perform the TEST");
+		new CreateFunctionCmd(addr(0x1100)).applyTo(program);
+		assertTrue("A takes C's code by flow", func(addr(0x1100)).getBody().contains(addr(0x1110)));
+
+		new CreateFunctionCmd(addr(0x1120)).applyTo(program);
+		program.endTransaction(transactionID, true);
+
+		Function a = func(addr(0x1100));
+		Function c = func(addr(0x1120));
+		assertEquals("A keeps only its own code", 3, a.getBody().getNumAddresses());
+		assertTrue("C takes its cold block", c.getBody().contains(addr(0x1110)));
+		assertEquals("C body", 8, c.getBody().getNumAddresses());
+	}
+
 	private Address addr(long l) {
 		AddressSpace addressSpace = program.getAddressFactory().getDefaultAddressSpace();
 		return addressSpace.getAddress(l);
