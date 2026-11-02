@@ -271,6 +271,34 @@ public class CreateFunctionCmdTest extends AbstractGenericTest {
 		program.endTransaction(transactionID, true);
 	}
 
+	/**
+	 * A function that jumps into a later function's body takes only the code it reaches below
+	 * that function's entry: a block there that only the later function reaches stays in it.
+	 */
+	@Test
+	public void testCreateOverlappingKeepsUnreachedCode() throws Exception {
+		// A: TEST EAX,EAX; JZ 0x1124; RET
+		builder.setBytes("0x1100", "85 c0 74 20 c3");
+		// B's block below its entry: INC EAX; RET
+		builder.setBytes("0x1110", "40 c3");
+		// B: TEST EAX,EAX; JNZ 0x1110
+		//    0x1124: DEC EAX; RET
+		builder.setBytes("0x1120", "85 c0 75 ec 48 c3");
+		builder.disassemble("0x1100", 5);
+		builder.disassemble("0x1110", 2);
+		builder.disassemble("0x1120", 6);
+
+		int transactionID = program.startTransaction("Perform the TEST");
+		new CreateFunctionCmd(addr(0x1120)).applyTo(program);
+		new CreateFunctionCmd(addr(0x1100)).applyTo(program);
+		program.endTransaction(transactionID, true);
+
+		Function funcB = func(addr(0x1120));
+		assertNotNull("Function at 0x1120", funcB);
+		assertTrue("Block left B", funcB.getBody().contains(addr(0x1110)));
+		assertNotNull("Function at 0x1100", func(addr(0x1100)));
+	}
+
 	private Address addr(long l) {
 		AddressSpace addressSpace = program.getAddressFactory().getDefaultAddressSpace();
 		return addressSpace.getAddress(l);
