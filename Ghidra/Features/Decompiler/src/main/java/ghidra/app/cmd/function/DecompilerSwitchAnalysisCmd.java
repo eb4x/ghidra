@@ -187,8 +187,8 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 			Address caseStart = cases[caseIndex];
 			monitor.checkCancelled();
 			
-			if (!isDefaultCase(caseValues, caseIndex)) {
-				// only non-default cases should be added to the switching instruction
+			if (!isDefaultCase(caseValues, caseIndex) || !isReachedElsewhere(caseStart, instr)) {
+				// a default case reached only from the switch must be referenced by it too
 				instr.addMnemonicReference(caseStart, flowType, SourceType.ANALYSIS);
 			}
 
@@ -224,13 +224,26 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 	 * A case is default if it is first case to not have a case value, or has a magic case value.
 	 * It is possible that there could be more than one case without a value.  The code shouldn't
 	 * blow up if this is the case.
-	 * 
-	 * TODO: Should this check if the default case already has a reference to it
-	 *       from a conditional jump?
 	 */
 	private boolean isDefaultCase(Integer[] caseValues, int caseIndex) {
 		return (caseIndex == caseValues.length) ||
 				(caseIndex < caseValues.length && caseValues[caseIndex] == DEFAULT_CASE_VALUE);
+	}
+
+	/*
+	 * Check if code other than the switching instruction flows to the target, by a flow
+	 * reference or by falling through.  The default case of a guarded switch is the guard's
+	 * other target, which the switch itself never reaches.
+	 */
+	private boolean isReachedElsewhere(Address target, Instruction instr) {
+		for (Reference ref : program.getReferenceManager().getReferencesTo(target)) {
+			if (ref.getReferenceType().isFlow() &&
+				!ref.getFromAddress().equals(instr.getMinAddress())) {
+				return true;
+			}
+		}
+		Instruction before = program.getListing().getInstructionBefore(target);
+		return before != null && target.equals(before.getFallThrough());
 	}
 
 	/*
@@ -266,8 +279,8 @@ public class DecompilerSwitchAnalysisCmd extends BackgroundCommand<Program> {
 				}
 			}
 			if (isDefaultCase) {
-				// default case should not be on switching instruction
-				if (foundit) {
+				// default case should not be on switching instruction when other code reaches it
+				if (foundit && isReachedElsewhere(tableDest[caseIndex], instr)) {
 					return false;
 				}
 			}
